@@ -1,4 +1,15 @@
 sqlalchemy
 psycopg2-binary
 redis
+fastapi
+uvicorn[standard]
+requests
+twilio
+openai>=1.0.0
+boto3
+pydantic
+sqlalchemy
+psycopg2-binary
+redis
 python-dotenv
+
