@@ -7,7 +7,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Install system deps: ffmpeg, libpq-dev (psycopg2), postgresql-client (psql), etc.
+# Install system packages: ffmpeg, build tools, libpq for psycopg2, and psql client
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
       ffmpeg \
@@ -23,15 +23,14 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --upgrade pip setuptools wheel
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# Copy application code into container
+# Copy app
 COPY . /app
 
-# Copy entrypoint and make executable
+# Ensure docker-entrypoint.sh is normalized (convert CRLF to LF) and executable
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
-RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+RUN sed -i 's/\r$//' /usr/local/bin/docker-entrypoint.sh && chmod +x /usr/local/bin/docker-entrypoint.sh
 
 EXPOSE ${PORT}
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["uvicorn", "ws_server:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
-
