@@ -148,45 +148,67 @@ def create_and_upload_tts(text: str, expires_in: int = TTS_PRESIGNED_EXPIRES) ->
     return presigned
 
 # ---------------- agent integration ----------------
-def call_agent_and_get_reply(convo_id: str, user_text: str) -> Dict[str, Any]:
+def call_agent_and_get_reply(convo_id: str, user_text: str, timeout: int = 15) -> Dict[str, Any]:
     """
-    Primary: call AGENT_ENDPOINT (your established ChatGPT agent).
-    Secondary: fallback to openai_client chat completions (if configured).
-    Return MUST be a dict possibly containing:
-      { "reply_text": "...", "memory_writes": [ { "fact_key": "...", "content": {...} }, ... ] }
-    The function returns a dict (not a raw string) to allow structured memory writes.
+    Robust agent caller:
+      - If AGENT_ENDPOINT is set, POST to it with Authorization: Bearer AGENT_KEY (if AGENT_KEY set).
+      - Accepts multiple possible shapes from agent:
+          { "reply": "..."} OR {"reply_text":"..."} OR {"text":"..."} OR {"reply_text":"...", "memory_writes":[...]}
+      - Returns dict: {"reply_text": str, "memory_writes": list}
+      - On network/agent error, falls back to calling OpenAI directly if openai_client is configured.
     """
-    if AGENT_ENDPOINT and AGENT_KEY:
+    # 1) Prefer external agent microservice
+    if AGENT_ENDPOINT:
         try:
-            r = requests.post(AGENT_ENDPOINT, json={"convo_id": convo_id, "text": user_text}, headers={"Authorization": f"Bearer {AGENT_KEY}", "Content-Type": "application/json"}, timeout=15)
+            headers = {"Content-Type": "application/json"}
+            if AGENT_KEY:
+                headers["Authorization"] = f"Bearer {AGENT_KEY}"
+            payload = {"convo_id": convo_id, "text": user_text}
+            logger.info("Calling external agent at %s (convo=%s)", AGENT_ENDPOINT, convo_id)
+            r = requests.post(AGENT_ENDPOINT, json=payload, headers=headers, timeout=timeout)
             r.raise_for_status()
             j = r.json()
-            # Ensure keys exist
-            return {
-                "reply_text": j.get("reply_text") or j.get("text") or "",
-                "memory_writes": j.get("memory_writes") or []
-            }
-        except Exception as e:
-            logger.exception("Agent endpoint error: %s", e)
+            # normalize reply_text
+            reply_text = j.get("reply_text") or j.get("reply") or j.get("text") or j.get("replyText") or ""
+            memory_writes = j.get("memory_writes") or j.get("memoryWrites") or []
+            # ensure types
+            if not isinstance(memory_writes, list):
+                memory_writes = []
+            return {"reply_text": reply_text, "memory_writes": memory_writes}
+        except requests.exceptions.RequestException as e:
+            logger.exception("Agent endpoint request failed: %s", e)
+        except ValueError:
+            logger.exception("Agent endpoint returned invalid JSON")
+        except Exception:
+            logger.exception("Unexpected error calling agent endpoint")
 
-    # fallback to OpenAI Chat
+    # 2) Fallback to local OpenAI client if available
     if openai_client:
         try:
+            logger.info("Falling back to OpenAI directly for convo=%s", convo_id)
             chat_resp = openai_client.chat.completions.create(
-                model="gpt-4o-mini",  # adjust as needed
+                model=os.environ.get("AGENT_MODEL", "gpt-4o-mini"),
                 messages=[{"role": "system", "content": "You are a helpful voice assistant."}, {"role": "user", "content": user_text}],
+                max_tokens=int(os.environ.get("AGENT_MAX_TOKENS", "256"))
             )
+            # extract message content robustly
             content = ""
             try:
-                content = chat_resp.choices[0].message["content"]
+                # prefer message content
+                choice = chat_resp.choices[0]
+                if hasattr(choice, "message") and choice.message:
+                    content = choice.message.get("content") if isinstance(choice.message, dict) else getattr(choice.message, "content", "")
+                else:
+                    content = getattr(choice, "text", "") or str(chat_resp)
             except Exception:
                 content = str(chat_resp)
-            return {"reply_text": content, "memory_writes": []}
+            return {"reply_text": (content or "").strip(), "memory_writes": []}
         except Exception:
-            logger.exception("OpenAI chat failure")
+            logger.exception("OpenAI chat fallback failed")
             return {"reply_text": "Sorry, I'm having trouble right now.", "memory_writes": []}
 
-    # last resort: echo
+    # 3) Last resort echo
+    logger.warning("No agent and no OpenAI client available for convo=%s", convo_id)
     return {"reply_text": f"Echo: {user_text}", "memory_writes": []}
 
 # ---------------- transcription ----------------
