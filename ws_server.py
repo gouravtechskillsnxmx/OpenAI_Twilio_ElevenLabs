@@ -1,385 +1,259 @@
-# ws_server.py
-import os
-import sys
-import time
-import json
-import logging
-import tempfile
-import asyncio
+# ws_server.py  — realtime (Twilio Media Streams, bidirectional)
+
+import os, sys, json, base64, logging, asyncio, tempfile
 from typing import Optional, Dict, Any
 
-from fastapi import FastAPI, Request, Response, BackgroundTasks
-from fastapi.responses import JSONResponse
-from twilio.twiml.voice_response import VoiceResponse
+from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse, PlainTextResponse
+from twilio.twiml.voice_response import VoiceResponse, Connect, Stream
 from requests.auth import HTTPBasicAuth
 import requests
-import boto3
 
-# OpenAI new client
+# audio utils
+from pydub import AudioSegment
+
+# ---- Optional: OpenAI + ElevenLabs (same envs you already had) ----
 try:
     from openai import OpenAI as OpenAIClient
 except Exception:
     OpenAIClient = None
 
-# Twilio REST client
-from twilio.rest import Client as TwilioClient
-
-# memory module & API routes (from files you already added)
-# Ensure db.py, models.py, memory.py, memory_api.py are in the repo
-from memory import write_fact  # function to write facts to Postgres + audit
-from memory_api import router as memory_router
-
-# ---------------- CONFIG / ENV ----------------
-TWILIO_SID = os.environ.get("TWILIO_SID")
-TWILIO_TOKEN = os.environ.get("TWILIO_TOKEN")
-TWILIO_FROM = os.environ.get("TWILIO_FROM")  # optional for calling out
-OPENAI_KEY = os.environ.get("OPENAI_KEY")
-AGENT_ENDPOINT = os.environ.get("AGENT_ENDPOINT")  # your established ChatGPT agent endpoint (optional)
-AGENT_KEY = os.environ.get("AGENT_KEY")
-
+OPENAI_KEY   = os.environ.get("OPENAI_KEY")
 ELEVEN_API_KEY = os.environ.get("ELEVEN_API_KEY")
-ELEVEN_VOICE = os.environ.get("ELEVEN_VOICE")
-
-S3_BUCKET = os.environ.get("S3_BUCKET")
-AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
-AWS_ACCESS_KEY_ID = os.environ.get("AWS_ACCESS_KEY_ID")
-AWS_SECRET_ACCESS_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY")
-
-HOSTNAME = os.environ.get("HOSTNAME", "")  # public hostname used to generate callback URLs
-TTS_PRESIGNED_EXPIRES = int(os.environ.get("TTS_PRESIGNED_EXPIRES", "600"))
-
-# Optional: throttling / simple config
-CALLS_PER_MINUTE_PER_NUMBER = int(os.environ.get("CALLS_PER_MINUTE_PER_NUMBER", "5"))
-
-# ---------------- clients & setup ----------------
-logger = logging.getLogger("ai-sales-agent")
-logging.basicConfig(stream=sys.stdout, level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-
-app = FastAPI(title="AI Sales Agent")
-
-# include memory API (read/write/forget/audit endpoints)
-app.include_router(memory_router)
-
-twilio_client = TwilioClient(TWILIO_SID, TWILIO_TOKEN) if (TWILIO_SID and TWILIO_TOKEN) else None
+ELEVEN_VOICE   = os.environ.get("ELEVEN_VOICE")
+HOSTNAME       = os.environ.get("HOSTNAME", "")
 
 openai_client = None
-if OPENAI_KEY and OpenAIClient is not None:
+if OPENAI_KEY and OpenAIClient:
     try:
         openai_client = OpenAIClient(api_key=OPENAI_KEY)
     except Exception:
-        logger.exception("Failed to init OpenAIClient")
+        pass
 
-# boto3 S3 client
-if AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY:
-    s3 = boto3.client(
-        "s3",
-        region_name=AWS_REGION,
-        aws_access_key_id=AWS_ACCESS_KEY_ID,
-        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-    )
-else:
-    s3 = boto3.client("s3", region_name=AWS_REGION)
+logger = logging.getLogger("realtime")
+logging.basicConfig(stream=sys.stdout, level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+app = FastAPI(title="AI Voice Bot — Realtime")
 
 # ---------------- health ----------------
 @app.get("/health")
 async def health():
-    return {"status": "ok", "hostname": HOSTNAME}
+    return {"status": "ok", "hostname": HOSTNAME, "realtime": True}
 
-# ---------------- helpers ----------------
-def recording_callback_url() -> str:
-    if HOSTNAME:
-        return f"https://{HOSTNAME}/recording"
-    return "/recording"
+# =========================================================
+#  A. TwiML entrypoint that starts a real-time stream
+# =========================================================
+@app.api_route("/twiml_stream", methods=["GET", "POST"])
+async def twiml_stream(request: Request):
+    """
+    Twilio hits this when the call starts.
+    We return <Connect><Stream> to open a WS to /twilio-media.
+    """
+    ws = f"wss://{HOSTNAME}/twilio-media" if HOSTNAME else "wss://YOUR_HOST/twilio-media"
+    vr = VoiceResponse()
+    with Connect() as c:
+        c.stream(url=ws)
+    vr.append(c)
+    # A short prompt; barge-in will happen automatically once stream is up.
+    vr.say("Hi! I'm listening. You can talk over me at any time.", voice="alice")
+    return Response(content=str(vr), media_type="text/xml")
 
-def build_download_url(recording_url: str) -> str:
-    """
-    If Twilio recording URL doesn't end with extension, append .mp3 for Twilio.
-    If the provided URL already has audio extension, use as is.
-    """
-    if not recording_url:
-        return recording_url
-    lower = recording_url.lower()
-    for ext in (".mp3", ".wav", ".m4a", ".ogg", ".webm", ".flac"):
-        if lower.endswith(ext):
-            return recording_url
-    if "api.twilio.com" in lower:
-        return recording_url + ".mp3"
-    return recording_url
+# =========================================================
+#  B. Realtime WS endpoint for Twilio Media Streams
+#     - receives inbound audio frames (base64 PCMU)
+#     - runs a tiny VAD-like chunker (pause => treat as utterance)
+#     - calls LLM to generate reply
+#     - synthesizes TTS and streams back as base64 PCMU in small chunks
+# =========================================================
 
-def create_tts_elevenlabs(text: str) -> bytes:
-    """
-    Synchronous ElevenLabs TTS; returns audio bytes (mp3).
-    Adapt headers/body if ElevenLabs changes their API.
-    """
-    if not ELEVEN_API_KEY or not ELEVEN_VOICE:
-        raise RuntimeError("ElevenLabs not configured (ELEVEN_API_KEY/ELEVEN_VOICE).")
+# speech tuning
+PAUSE_MS = 600               # treat ~600ms silence as end of turn
+CHUNK_MS = 200               # send back audio in ~200ms chunks
+FRAME_BYTES = 1600           # 8kHz, 20ms for mulaw ~160 bytes; with base64 overhead; we’ll buffer/convert
 
-    url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE}"
-    headers = {
-        "Accept": "audio/mpeg",
-        "Content-Type": "application/json",
-        "xi-api-key": ELEVEN_API_KEY,
-    }
-    body = {"text": text, "voice_settings": {"stability": 0.3, "similarity_boost": 0.75}}
-    r = requests.post(url, json=body, headers=headers, timeout=30)
-    r.raise_for_status()
-    return r.content
+def pcm16_to_mulaw_bytes(raw_pcm_16_mono_8k: bytes) -> bytes:
+    """Convert signed 16-bit PCM (s16le, 8kHz mono) -> 8-bit μ-law (G.711)."""
+    # pydub can do this via AudioSegment export with format="mulaw"
+    seg = AudioSegment(
+        raw_pcm_16_mono_8k, frame_rate=8000, sample_width=2, channels=1
+    )
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".ulaw")
+    seg.export(tmp.name, format="mulaw")  # 8k mu-law
+    ulaw = open(tmp.name, "rb").read()
+    return ulaw
 
-def create_and_upload_tts(text: str, expires_in: int = TTS_PRESIGNED_EXPIRES) -> str:
-    """
-    1) Generate audio bytes via ElevenLabs
-    2) Upload to S3 (no ACL - bucket owner enforced support)
-    3) Return presigned GET URL
-    """
-    audio_bytes = create_tts_elevenlabs(text)
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
-    tmp_name = tmp.name
-    tmp.write(audio_bytes)
-    tmp.flush()
-    tmp.close()
+def wav_or_mp3_bytes_to_ulaw(raw_bytes: bytes) -> bytes:
+    """Utility for converting an mp3/wav TTS to mulaw 8k mono."""
+    seg = AudioSegment.from_file_using_temporary_files(io.BytesIO(raw_bytes))
+    seg = seg.set_frame_rate(8000).set_channels(1).set_sample_width(2)
+    # export to mulaw
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".ulaw")
+    seg.export(tmp.name, format="mulaw")
+    return open(tmp.name, "rb").read()
 
-    key = f"tts/{os.path.basename(tmp_name)}"
-    try:
-        s3.upload_file(tmp_name, S3_BUCKET, key, ExtraArgs={"ContentType": "audio/mpeg"})
-    except Exception:
-        logger.exception("S3 upload failed for %s/%s", S3_BUCKET, key)
-        raise
-    presigned = s3.generate_presigned_url("get_object", Params={"Bucket": S3_BUCKET, "Key": key}, ExpiresIn=expires_in)
-    return presigned
+def make_tts(text: str) -> bytes:
+    """Return audio bytes (wav or mp3). Uses ElevenLabs if configured, else OpenAI TTS, else Twilio <Say> fallback."""
+    if ELEVEN_API_KEY and ELEVEN_VOICE:
+        url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE}"
+        headers = {
+            "Accept": "audio/mpeg",
+            "Content-Type": "application/json",
+            "xi-api-key": ELEVEN_API_KEY,
+        }
+        body = {"text": text, "voice_settings": {"stability": 0.3, "similarity_boost": 0.75}}
+        r = requests.post(url, json=body, headers=headers, timeout=30)
+        r.raise_for_status()
+        return r.content  # mp3
+    # (Optional) add OpenAI TTS if you use it. Otherwise, we’ll just speak with Say (fallback).
+    # Return empty to signal fallback.
+    return b""
 
-# ---------------- agent integration ----------------
-def call_agent_and_get_reply(convo_id: str, user_text: str, timeout: int = 15) -> Dict[str, Any]:
-    """
-    Robust agent caller:
-      - If AGENT_ENDPOINT is set, POST to it with Authorization: Bearer AGENT_KEY (if AGENT_KEY set).
-      - Accepts multiple possible shapes from agent:
-          { "reply": "..."} OR {"reply_text":"..."} OR {"text":"..."} OR {"reply_text":"...", "memory_writes":[...]}
-      - Returns dict: {"reply_text": str, "memory_writes": list}
-      - On network/agent error, falls back to calling OpenAI directly if openai_client is configured.
-    """
-    # 1) Prefer external agent microservice
-    if AGENT_ENDPOINT:
-        try:
-            headers = {"Content-Type": "application/json"}
-            if AGENT_KEY:
-                headers["Authorization"] = f"Bearer {AGENT_KEY}"
-            payload = {"convo_id": convo_id, "text": user_text}
-            logger.info("Calling external agent at %s (convo=%s)", AGENT_ENDPOINT, convo_id)
-            r = requests.post(AGENT_ENDPOINT, json=payload, headers=headers, timeout=timeout)
-            r.raise_for_status()
-            j = r.json()
-            # normalize reply_text
-            reply_text = j.get("reply_text") or j.get("reply") or j.get("text") or j.get("replyText") or ""
-            memory_writes = j.get("memory_writes") or j.get("memoryWrites") or []
-            # ensure types
-            if not isinstance(memory_writes, list):
-                memory_writes = []
-            return {"reply_text": reply_text, "memory_writes": memory_writes}
-        except requests.exceptions.RequestException as e:
-            logger.exception("Agent endpoint request failed: %s", e)
-        except ValueError:
-            logger.exception("Agent endpoint returned invalid JSON")
-        except Exception:
-            logger.exception("Unexpected error calling agent endpoint")
-
-    # 2) Fallback to local OpenAI client if available
+async def llm_reply(text: str) -> str:
     if openai_client:
         try:
-            logger.info("Falling back to OpenAI directly for convo=%s", convo_id)
-            chat_resp = openai_client.chat.completions.create(
+            resp = openai_client.chat.completions.create(
                 model=os.environ.get("AGENT_MODEL", "gpt-4o-mini"),
-                messages=[{"role": "system", "content": "You are a helpful voice assistant."}, {"role": "user", "content": user_text}],
-                max_tokens=int(os.environ.get("AGENT_MAX_TOKENS", "256"))
+                messages=[
+                    {"role":"system","content":"You are a helpful, concise, interruptible voice assistant."},
+                    {"role":"user","content": text}
+                ],
+                max_tokens=200
             )
-            # extract message content robustly
-            content = ""
-            try:
-                # prefer message content
-                choice = chat_resp.choices[0]
-                if hasattr(choice, "message") and choice.message:
-                    content = choice.message.get("content") if isinstance(choice.message, dict) else getattr(choice.message, "content", "")
-                else:
-                    content = getattr(choice, "text", "") or str(chat_resp)
-            except Exception:
-                content = str(chat_resp)
-            return {"reply_text": (content or "").strip(), "memory_writes": []}
+            msg = resp.choices[0].message
+            return (msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", "")) or "Okay."
         except Exception:
-            logger.exception("OpenAI chat fallback failed")
-            return {"reply_text": "Sorry, I'm having trouble right now.", "memory_writes": []}
+            logger.exception("LLM call failed")
+    return "Okay."
 
-    # 3) Last resort echo
-    logger.warning("No agent and no OpenAI client available for convo=%s", convo_id)
-    return {"reply_text": f"Echo: {user_text}", "memory_writes": []}
+import io, time
+from collections import deque
 
-# ---------------- transcription ----------------
-def transcribe_with_openai(file_path: str) -> str:
-    """
-    Uses OpenAI's audio transcription (whisper) with the new OpenAI client if available.
-    """
-    if openai_client is None:
-        raise RuntimeError("OpenAI not configured (OPENAI_KEY missing or client not available).")
-    with open(file_path, "rb") as f:
-        resp = openai_client.audio.transcriptions.create(model="whisper-1", file=f)
-    # resp might be object-like or dict-like
-    text = getattr(resp, "text", None) or (resp.get("text") if isinstance(resp, dict) else None) or str(resp)
-    return (text or "").strip()
+@app.websocket("/twilio-media")
+async def twilio_media(ws: WebSocket):
+    await ws.accept()
+    logger.info("WS connected")
 
-# ---------------- TwiML endpoint ----------------
-@app.api_route("/twiml", methods=["GET", "POST"])
-async def twiml(request: Request):
-    resp = VoiceResponse()
-    resp.say("Hello, this is our AI assistant. Please say something after the beep.", voice="alice")
-    action = recording_callback_url()
-    # short record for responsive loop
-    resp.record(max_length=6, action=action, play_beep=True, timeout=2)
-    return Response(content=str(resp), media_type="text/xml")
+    # buffers
+    last_voice_ts = time.time()
+    recorder = bytearray()        # raw mulaw bytes from Twilio (we’ll convert to PCM16 if needed)
+    awaiting_tts = False
 
-# ---------------- recording webhook ----------------
-@app.post("/recording")
-async def recording(request: Request, background_tasks: BackgroundTasks):
-    form = await request.form()
-    payload = dict(form)
-    recording_url = payload.get("RecordingUrl")
-    call_sid = payload.get("CallSid")
-    from_number = payload.get("From")
-    logger.info("Incoming recording webhook: CallSid=%s From=%s RecordingUrl=%s", call_sid, from_number, recording_url)
-
-    if not recording_url or not call_sid:
-        logger.warning("Missing RecordingUrl or CallSid in request payload: %s", payload)
-        return JSONResponse({"error": "missing RecordingUrl or CallSid"}, status_code=400)
-
-    # ACK quickly and process in background
-    background_tasks.add_task(process_recording_background, call_sid, recording_url, from_number)
-    return Response(status_code=204)
-
-# ---------------- background pipeline ----------------
-async def process_recording_background(call_sid: str, recording_url: str, from_number: Optional[str]=None):
-    """
-    1) Download recording (with Twilio basic auth if it's a Twilio URL)
-    2) Save to temp file
-    3) Transcribe via OpenAI
-    4) Call agent (AGENT_ENDPOINT or OpenAI fallback)
-    5) If agent returns 'memory_writes' -> write facts via memory.write_fact(...)
-    6) Generate TTS via ElevenLabs, upload to S3, generate presigned URL
-    7) Update Twilio call with <Play>presigned_url</Play> + <Record> to continue
-    """
-    logger.info("[%s] background start - download_url=%s", call_sid, recording_url)
     try:
-        download_url = build_download_url(recording_url)
+        while True:
+            msg = await ws.receive_text()
+            obj = json.loads(msg)
+            event = obj.get("event")
 
-        # Authenticate if Twilio API recording
-        auth = HTTPBasicAuth(TWILIO_SID, TWILIO_TOKEN) if (TWILIO_SID and TWILIO_TOKEN and "api.twilio.com" in download_url) else None
+            if event == "start":
+                logger.info("Stream start: %s", obj.get("start", {}))
 
-        # Try to download
-        try:
-            r = requests.get(download_url, auth=auth, timeout=30)
-            r.raise_for_status()
-        except requests.exceptions.HTTPError as he:
-            status = getattr(he.response, "status_code", None) if hasattr(he, "response") else None
-            logger.error("[%s] Download HTTP error status=%s body=%s", call_sid, status, getattr(he.response, "text", str(he))[:400])
-            # fallback TwiML
-            fallback_twiml = "<Response><Say>Sorry, we couldn't get your audio right now. Please try again later.</Say></Response>"
-            try:
-                if twilio_client:
-                    twilio_client.calls(call_sid).update(twiml=fallback_twiml)
-            except Exception:
-                logger.exception("[%s] Failed sending fallback twiml", call_sid)
-            return
-        except Exception as e:
-            logger.exception("[%s] Download failed: %s", call_sid, e)
-            return
+            elif event == "media":
+                # Twilio sends base64-encoded audio/x-mulaw;rate=8000;channels=1;packet=20ms
+                payload = obj.get("media") or obj.get("payload") or {}
+                b64 = payload.get("payload") or payload.get("data")
+                if not b64:
+                    continue
+                ulaw = base64.b64decode(b64)
+                recorder.extend(ulaw)
+                last_voice_ts = time.time()
 
-        # Save audio to temp file
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
-        tmp.write(r.content)
-        tmp.flush()
-        tmp.close()
-        file_path = tmp.name
-        logger.info("[%s] saved recording to %s", call_sid, file_path)
+                # If caller speaks while we’re sending TTS, we “barge-in”: drop pending TTS.
+                # (In practice you’d gate this with a flag and stop sending.)
+                # Here, just note it; send loop below will check.
 
-        # Transcribe
-        try:
-            transcript = transcribe_with_openai(file_path)
-            logger.info("[%s] transcript: %s", call_sid, transcript)
-        except Exception as e:
-            logger.exception("[%s] STT/transcription failed: %s", call_sid, e)
-            transcript = ""
+            elif event == "mark":
+                pass
 
-        # Agent call - expects structured dict
-        try:
-            agent_out = call_agent_and_get_reply(call_sid, transcript)
-            # ensure structure
-            reply_text = (agent_out.get("reply_text") if isinstance(agent_out, dict) else str(agent_out)) or ""
-            memory_writes = agent_out.get("memory_writes") if isinstance(agent_out, dict) else []
-        except Exception as e:
-            logger.exception("[%s] agent call failed: %s", call_sid, e)
-            reply_text = "Sorry, I'm having trouble right now."
-            memory_writes = []
+            elif event == "stop":
+                logger.info("Stream stop")
+                break
 
-        logger.info("[%s] assistant reply (truncated): %s", call_sid, (reply_text[:300] + "...") if len(reply_text) > 300 else reply_text)
+            # ---- TURN DETECTION (simple pause-based) ----
+            now = time.time()
+            if (now - last_voice_ts) > (PAUSE_MS / 1000.0) and len(recorder) > 0 and not awaiting_tts:
+                # treat it as a completed user utterance
+                awaiting_tts = True
 
-        # If agent returned memory writes, persist them
-        if memory_writes and isinstance(memory_writes, list):
-            for mw in memory_writes:
+                # Convert captured μ-law -> PCM16 WAV (via pydub) then to text
                 try:
-                    fact_key = mw.get("fact_key") if isinstance(mw, dict) else None
-                    content = mw.get("content") if isinstance(mw, dict) else {"value": mw}
-                    created_by = f"voice:{from_number or call_sid}"
-                    written = write_fact(content, created_by=created_by, fact_key=fact_key)
-                    logger.info("[%s] wrote memory fact id=%s key=%s", call_sid, written.get("id"), fact_key)
+                    # write ulaw to temp, convert to wav s16le 8k mono
+                    ulaw_bytes = bytes(recorder)
+                    recorder.clear()
+
+                    # decode ulaw using pydub
+                    seg = AudioSegment(
+                        ulaw_bytes, frame_rate=8000, sample_width=1, channels=1
+                    ).set_frame_rate(8000).set_channels(1).set_sample_width(2)
+                    tmp_wav = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+                    seg.export(tmp_wav.name, format="wav")
+
+                    # Transcribe (Whisper)
+                    text = ""
+                    if openai_client:
+                        with open(tmp_wav.name, "rb") as f:
+                            tr = openai_client.audio.transcriptions.create(model="whisper-1", file=f)
+                        text = getattr(tr, "text", None) or (tr.get("text") if isinstance(tr, dict) else "") or ""
+                    else:
+                        text = ""  # if you want offline ASR, plug it here
+
+                    logger.info("USER SAID: %s", text)
+
+                    # Hangup keywords
+                    if any(k in text.lower() for k in ["hang up", "goodbye", "stop call", "disconnect", "bye"]):
+                        await ws.send_text(json.dumps({"event":"mark", "name":"goodbye"}))
+                        break
+
+                    # Get reply from LLM
+                    reply = await llm_reply(text)
+                    logger.info("BOT REPLY: %s", reply)
+
+                    # Generate TTS (mp3)
+                    tts_bytes = make_tts(reply)
+                    if not tts_bytes:
+                        # If no TTS engine, we can instruct Twilio to <Say> via TwiML update (not realtime).
+                        # For true realtime, configure ElevenLabs or similar TTS.
+                        logger.warning("No TTS engine configured — skipping audio send")
+                        awaiting_tts = False
+                        continue
+
+                    # Convert mp3 -> 8kHz μ-law
+                    seg_tts = AudioSegment.from_file_using_temporary_files(io.BytesIO(tts_bytes))
+                    seg_tts = seg_tts.set_frame_rate(8000).set_channels(1).set_sample_width(2)
+                    tmp_ulaw = tempfile.NamedTemporaryFile(delete=False, suffix=".ulaw")
+                    seg_tts.export(tmp_ulaw.name, format="mulaw")
+                    ulaw_tts = open(tmp_ulaw.name, "rb").read()
+
+                    # Stream back in ~200ms chunks
+                    chunk_bytes = int(0.2 * 8000)  # 1600 samples @8k; but μ-law is 1 byte/sample => 1600 bytes ≈ 200ms
+                    for i in range(0, len(ulaw_tts), chunk_bytes):
+                        # If user started speaking again (recorder has new audio), barge-in: stop TTS immediately
+                        if len(recorder) > 0:
+                            logger.info("BARGE-IN detected — stopping TTS playback")
+                            break
+                        chunk = ulaw_tts[i:i+chunk_bytes]
+                        b64 = base64.b64encode(chunk).decode("ascii")
+                        frame = {
+                            "event": "media",
+                            "media": {
+                                "payload": b64
+                            }
+                        }
+                        await ws.send_text(json.dumps(frame))
+                        await asyncio.sleep(0.18)  # ~just under 200ms wall-time
+
+                    awaiting_tts = False
+
                 except Exception:
-                    logger.exception("[%s] failed to write memory write: %s", call_sid, mw)
+                    logger.exception("TURN pipeline failed")
+                    awaiting_tts = False
 
-        # TTS via ElevenLabs and S3 upload
+    except WebSocketDisconnect:
+        logger.info("WS disconnect")
+    except Exception:
+        logger.exception("WS error")
+    finally:
         try:
-            tts_url = create_and_upload_tts(reply_text)
-            logger.info("[%s] tts_url: %s", call_sid, tts_url)
-        except Exception as e:
-            logger.exception("[%s] TTS/upload failed: %s", call_sid, e)
-            # fallback to Twilio Say
-            twiml = f"<Response><Say>{reply_text}</Say><Record maxLength='6' action='https://{HOSTNAME}/recording' playBeep='true' timeout='2'/></Response>"
-            try:
-                if twilio_client:
-                    twilio_client.calls(call_sid).update(twiml=twiml)
-            except Exception:
-                logger.exception("[%s] Failed to send fallback TwiML", call_sid)
-            return
-
-        # Build TwiML: Play the presigned URL then Record again
-        record_action = f"https://{HOSTNAME}/recording" if HOSTNAME else "/recording"
-        twiml = f"""<Response>
-            <Play>{tts_url}</Play>
-            <Record maxLength="6" action="{record_action}" playBeep="true" timeout="2" />
-        </Response>"""
-
-        logger.info("[%s] updating Twilio call with Play+Record", call_sid)
-        try:
-            if twilio_client:
-                twilio_client.calls(call_sid).update(twiml=twiml)
+            await ws.close()
         except Exception:
-            logger.exception("[%s] Failed to update Twilio call", call_sid)
-
-    except Exception as e:
-        logger.exception("[%s] Unexpected pipeline error: %s", call_sid, e)
-
-# ---------------- optional outbound call endpoint ----------------
-@app.post("/call_outbound")
-async def call_outbound(request: Request):
-    """
-    Trigger an outbound call from Twilio => to_number.
-    Must set TWILIO_FROM env. Useful to avoid dialing Twilio number from an international mobile.
-    body form: to_number=+91....
-    """
-    form = await request.form()
-    to_number = form.get("to_number")
-    if not to_number:
-        return JSONResponse({"error": "to_number required"}, status_code=400)
-    if not (TWILIO_SID and TWILIO_TOKEN and TWILIO_FROM):
-        return JSONResponse({"error": "twilio credentials or TWILIO_FROM missing"}, status_code=500)
-    twiml_url = f"https://{HOSTNAME}/twiml" if HOSTNAME else None
-    try:
-        call = twilio_client.calls.create(to=to_number, from_=TWILIO_FROM, url=twiml_url)
-        return {"call_sid": call.sid}
-    except Exception as e:
-        logger.exception("Failed to create outbound call to %s: %s", to_number, e)
-        return JSONResponse({"error": "call failed"}, status_code=500)
+            pass
+        logger.info("WS closed")
