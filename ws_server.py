@@ -50,12 +50,14 @@ async def twiml_stream(request: Request):
     We return <Connect><Stream> to open a WS to /twilio-media.
     """
     ws = f"wss://{HOSTNAME}/twilio-media" if HOSTNAME else "wss://YOUR_HOST/twilio-media"
+  
     vr = VoiceResponse()
+      # A short prompt; barge-in will happen automatically once stream is up.
+    vr.say("Hi! I'm listening. You can talk over me at any time.", voice="alice")
     with Connect() as c:
         c.stream(url=ws)
     vr.append(c)
-    # A short prompt; barge-in will happen automatically once stream is up.
-    vr.say("Hi! I'm listening. You can talk over me at any time.", voice="alice")
+
     return Response(content=str(vr), media_type="text/xml")
 
 # =========================================================
