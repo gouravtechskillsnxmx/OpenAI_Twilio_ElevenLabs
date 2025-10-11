@@ -33,5 +33,5 @@ RUN sed -i 's/\r$//' /usr/local/bin/docker-entrypoint.sh && chmod +x /usr/local/
 EXPOSE ${PORT}
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
-CMD ["uvicorn", "ws_server:app", "--host", "0.0.0.0", "--port", "$PORT", "--workers", "1"]
+CMD ["sh", "-lc", "uvicorn ws_server:app --host 0.0.0.0 --port $PORT --workers 1"]
 
