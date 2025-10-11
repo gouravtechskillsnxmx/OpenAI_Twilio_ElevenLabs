@@ -137,18 +137,33 @@ async def health():
 
 # =========================================================
 #  A. TwiML entrypoint that starts a real-time stream
-# =========================================================
+# =========================================================from fastapi import Request, Response
+
 @app.api_route("/twiml_stream", methods=["GET", "POST"])
 async def twiml_stream(request: Request):
-    ws = f"wss://{HOSTNAME}/twilio-media" if HOSTNAME else "wss://YOUR_HOST/twilio-media"
-    vr = VoiceResponse()
-    vr.say("Hi! I'm listening. You can talk over me at any time.", voice="alice")
-    with Connect() as c:
-        # IMPORTANT: request both directions explicitly so Twilio knows this stream will be bidirectional
-        c.stream(url=ws, track="both")
-    vr.append(c)
-    return Response(content=str(vr), media_type="text/xml")
+    """
+    Recommended TwiML: explicit <Start><Stream url="wss://.../twilio-media" track="both"/></Start>
+    then a Say and a long Pause so the call stays open while the websocket handles media.
+    """
+    if not HOSTNAME:
+        xml = (
+            "<Response>"
+            "<Say voice='alice'>Server hostname is not configured. Please set HOSTNAME environment variable.</Say>"
+            "</Response>"
+        )
+        logger.warning("HOSTNAME not set; returning debug TwiML.")
+        return Response(content=xml, media_type="text/xml")
 
+    ws_url = f"wss://{HOSTNAME}/twilio-media"
+    twiml = (
+        "<Response>"
+        f"<Start><Stream url=\"{ws_url}\" track=\"both\"/></Start>"
+        "<Say voice='alice'>Hi — connecting you now. Please wait.</Say>"
+        "<Pause length='600'/>"
+        "</Response>"
+    )
+    logger.info("Returning TwiML: %s", twiml)
+    return Response(content=twiml, media_type="text/xml")
 
 # =========================================================
 #  B. Realtime WS endpoint for Twilio Media Streams
