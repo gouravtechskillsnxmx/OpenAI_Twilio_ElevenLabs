@@ -1,188 +1,140 @@
-# ws_server.py — consolidated stable version
-import os
-import sys
-import io
-import json
-import time
-import base64
-import wave
-import struct
-import logging
-import tempfile
-import subprocess
-import asyncio
+# ws_server.py — diagnostic + audible fallback patch
+import os, sys, io, json, time, base64, wave, struct, tempfile, logging, subprocess, asyncio
 from typing import Optional
-
 from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect
 from twilio.twiml.voice_response import VoiceResponse
 import requests
-from pydub import AudioSegment
-import audioop
 
-# ----- Configuration / env -----
-HOSTNAME = os.environ.get("HOSTNAME", "").strip()  # must be public domain reachable by Twilio (no scheme)
+# optional dependencies
+try:
+    from pydub import AudioSegment
+    import audioop
+    HAS_PYDUB = True
+except Exception:
+    HAS_PYDUB = False
+
+HOSTNAME = os.environ.get("HOSTNAME", "").strip()
 ELEVEN_API_KEY = os.environ.get("ELEVEN_API_KEY")
 ELEVEN_VOICE = os.environ.get("ELEVEN_VOICE")
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger("ws_server")
+logger = logging.getLogger("ws_server_diag")
 
-app = FastAPI(title="AI Voice — Realtime (stable)")
+app = FastAPI()
 
-# ----- Utilities -----
+# silence detection (ms)
+PAUSE_MS = 900  # slightly longer to be safer (0.9s)
+
 def make_tts(text: str) -> bytes:
     """
-    Return audio bytes (mp3/wav). Use ElevenLabs if configured, otherwise return a short debug WAV.
+    Use ElevenLabs if configured. Otherwise return a short *audible* tone WAV (not silent)
+    so outbound path can be validated by ear.
     """
     if ELEVEN_API_KEY and ELEVEN_VOICE:
         try:
             url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE}"
-            headers = {
-                "Accept": "audio/mpeg",
-                "Content-Type": "application/json",
-                "xi-api-key": ELEVEN_API_KEY,
-            }
+            headers = {"Accept": "audio/mpeg", "Content-Type": "application/json", "xi-api-key": ELEVEN_API_KEY}
             body = {"text": text, "voice_settings": {"stability": 0.3, "similarity_boost": 0.75}}
             r = requests.post(url, json=body, headers=headers, timeout=30)
             r.raise_for_status()
             logger.info("ElevenLabs TTS returned %d bytes", len(r.content))
             return r.content
         except Exception:
-            logger.exception("ElevenLabs TTS call failed — falling back to debug WAV")
+            logger.exception("ElevenLabs TTS failed — falling back to audible test tone")
 
-    # Debug fallback: return a short silent WAV to validate outbound streaming path
-    try:
-        duration_s = 0.6
-        sr = 16000
-        nframes = int(duration_s * sr)
-        buf = io.BytesIO()
-        wf = wave.open(buf, 'wb')
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(sr)
-        # write silence
-        for _ in range(nframes):
-            wf.writeframes(struct.pack('<h', 0))
-        wf.close()
-        data = buf.getvalue()
-        logger.info("Returning debug silent WAV (%d bytes) from make_tts", len(data))
-        return data
-    except Exception:
-        logger.exception("Failed to produce debug WAV")
-        return b""
+    # Audible tone fallback (WAV PCM16 16000Hz, ~0.6s, 440Hz)
+    sr = 16000
+    duration = 0.6
+    nframes = int(sr * duration)
+    buf = io.BytesIO()
+    wf = wave.open(buf, 'wb')
+    wf.setnchannels(1)
+    wf.setsampwidth(2)
+    wf.setframerate(sr)
+    amplitude = 8000
+    for i in range(nframes):
+        t = i / sr
+        sample = int(amplitude * (0.6 * 1.0) * __import__('math').sin(2 * __import__('math').pi * 440 * t))
+        wf.writeframes(struct.pack('<h', sample))
+    wf.close()
+    data = buf.getvalue()
+    logger.info("Returning audible test-tone WAV (%d bytes) from make_tts", len(data))
+    return data
 
-def convert_to_mulaw_8k_ffmpeg(input_bytes: bytes) -> bytes:
-    """
-    Convert input audio bytes (wav or mp3) to raw μ-law 8k mono using ffmpeg.
-    Requires ffmpeg in PATH.
-    """
-    cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error",
-        "-i", "pipe:0",
-        "-ar", "8000", "-ac", "1", "-f", "mulaw",
-        "pipe:1"
-    ]
+def convert_to_mulaw_ffmpeg(in_bytes: bytes) -> bytes:
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", "pipe:0", "-ar", "8000", "-ac", "1", "-f", "mulaw", "pipe:1"]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    out, err = proc.communicate(input=input_bytes)
+    out, err = proc.communicate(input=in_bytes)
     if proc.returncode != 0:
-        logger.error("ffmpeg conversion failed: %s", err.decode("utf-8", errors="ignore"))
-        raise RuntimeError("ffmpeg conversion failed")
+        logger.error("ffmpeg conversion error: %s", err.decode('utf8', errors='ignore'))
+        raise RuntimeError("ffmpeg failed")
     return out
 
-def convert_to_mulaw_8k_pydub(input_bytes: bytes) -> bytes:
-    """
-    Convert using pydub + audioop as fallback (no external ffmpeg required if pydub can read bytes).
-    Produces μ-law 8k raw bytes.
-    """
-    seg = AudioSegment.from_file_using_temporary_files(io.BytesIO(input_bytes))
-    seg = seg.set_frame_rate(8000).set_channels(1).set_sample_width(2)  # s16le
+def convert_to_mulaw_pydub(in_bytes: bytes) -> bytes:
+    if not HAS_PYDUB:
+        raise RuntimeError("pydub not available")
+    seg = AudioSegment.from_file_using_temporary_files(io.BytesIO(in_bytes))
+    seg = seg.set_frame_rate(8000).set_channels(1).set_sample_width(2)
     pcm = seg.raw_data
-    # convert s16le PCM to mu-law
     ulaw = audioop.lin2ulaw(pcm, 2)
     return ulaw
 
-async def stream_mulaw_chunks(ws: WebSocket, stream_sid: str, mulaw_bytes: bytes, frame_ms: int = 20):
-    """
-    Stream μ-law bytes to Twilio via websocket as outbound media frames (track='outbound').
-    """
+async def stream_ulaw(ws: WebSocket, stream_sid: str, ulaw_bytes: bytes, frame_ms: int = 20):
     sample_rate = 8000
-    bytes_per_sample = 1  # μ-law 8-bit
-    chunk_size = int(sample_rate * (frame_ms / 1000.0) * bytes_per_sample)  # e.g., 160 bytes for 20ms
-
+    bytes_per_sample = 1
+    chunk = int(sample_rate * (frame_ms / 1000.0) * bytes_per_sample)
     offset = 0
-    total = len(mulaw_bytes)
-    frames_sent = 0
-    while offset < total:
-        chunk = mulaw_bytes[offset: offset + chunk_size]
-        offset += chunk_size
-        payload_b64 = base64.b64encode(chunk).decode("ascii")
-        msg = {
+    frames = 0
+    while offset < len(ulaw_bytes):
+        block = ulaw_bytes[offset:offset+chunk]
+        offset += chunk
+        await ws.send_text(json.dumps({
             "event": "media",
             "streamSid": stream_sid,
-            "media": {
-                "track": "outbound",   # CRITICAL: Twilio needs this to play into the call
-                "payload": payload_b64
-            }
-        }
-        await ws.send_text(json.dumps(msg))
-        frames_sent += 1
-        # pace for real-time playback
-        await asyncio.sleep(frame_ms / 1000.0)
-    logger.info("stream_mulaw_chunks finished: %d frames, %d bytes", frames_sent, total)
+            "media": {"track": "outbound", "payload": base64.b64encode(block).decode("ascii")}
+        }))
+        frames += 1
+        if frames % 25 == 0:
+            logger.info("Sent %d outbound frames (~%d ms)", frames, frames*frame_ms)
+        await asyncio.sleep(frame_ms/1000.0)
+    logger.info("Completed streaming outbound: %d frames (%d bytes)", frames, len(ulaw_bytes))
 
-async def llm_reply_stub(text: str) -> str:
-    """
-    Placeholder LLM reply. Replace with your real LLM call (OpenAI, local model, etc).
-    """
-    return "I heard you. This is an example reply from the assistant."
-
-# ----- FastAPI endpoints -----
-@app.api_route("/twiml_stream", methods=["GET", "POST"])
+@app.api_route("/twiml_stream", methods=["GET","POST"])
 async def twiml_stream(request: Request):
-    """
-    Return TwiML that starts a bidirectional Media Stream and keeps the call alive while the websocket is active.
-    HOSTNAME must be set to a publicly reachable domain (no scheme).
-    """
     if not HOSTNAME:
-        xml = (
-            "<Response>"
-            "<Say voice='alice'>Server hostname is not configured. Please set HOSTNAME environment variable.</Say>"
-            "</Response>"
-        )
-        logger.warning("HOSTNAME not set — returning debug TwiML")
+        xml = "<Response><Say voice='alice'>HOSTNAME not configured. Set HOSTNAME env var.</Say></Response>"
+        logger.warning("HOSTNAME missing; returning debug TwiML")
         return Response(content=xml, media_type="text/xml")
-
     ws_url = f"wss://{HOSTNAME}/twilio-media"
-    twiml = (
+    xml = (
         "<Response>"
         f"<Start><Stream url=\"{ws_url}\" track=\"both\"/></Start>"
         "<Say voice='alice'>Hi — connecting you now. Please wait.</Say>"
         "<Pause length='600'/>"
         "</Response>"
     )
-    logger.info("Returning TwiML: %s", twiml)
-    return Response(content=twiml, media_type="text/xml")
-
-PAUSE_MS = 600  # ms pause to detect end of utterance (turn-taking)
+    logger.info("Returning TwiML: %s", xml)
+    return Response(content=xml, media_type="text/xml")
 
 @app.websocket("/twilio-media")
 async def twilio_media(ws: WebSocket):
     await ws.accept()
-    logger.info("WS connected. scope headers: %s", ws.scope.get("headers"))
+    logger.info("WS connected. headers=%s", ws.scope.get("headers"))
     stream_sid: Optional[str] = None
     recorder = bytearray()
     last_voice_ts = time.time()
-    awaiting_tts = False
+    awaiting = False
 
     try:
         while True:
             raw = await ws.receive_text()
             obj = json.loads(raw)
             event = obj.get("event")
-            # handle start, media, stop, other events
+            # LOG raw event for debugging
+            logger.debug("Raw WS event: %s", json.dumps(obj)[:800])
+
             if event == "start":
-                start_obj = obj.get("start") or {}
-                stream_sid = start_obj.get("streamSid")
+                stream_sid = (obj.get("start") or {}).get("streamSid")
                 logger.info("Stream start sid=%s", stream_sid)
 
             elif event == "media":
@@ -191,113 +143,76 @@ async def twilio_media(ws: WebSocket):
                 track = media.get("track")
                 if payload:
                     chunk = base64.b64decode(payload)
-                    # Twilio sends inbound as μ-law 8k typically
                     recorder.extend(chunk)
                     last_voice_ts = time.time()
+                    logger.info("INBOUND media event: track=%s payload_bytes=%d total_buffered=%d", track, len(chunk), len(recorder))
+                else:
+                    logger.info("media event with no payload")
 
             elif event == "stop":
                 logger.info("Stream stop event received")
                 break
 
-            # TURN detection: if silence gap and we have recorded audio, process it
+            # TURN detection
             now = time.time()
-            if (now - last_voice_ts) * 1000.0 > PAUSE_MS and len(recorder) > 0 and not awaiting_tts:
-                awaiting_tts = True
+            if (now - last_voice_ts) * 1000.0 > PAUSE_MS and len(recorder) > 0 and not awaiting:
+                awaiting = True
                 try:
                     inbound_ulaw = bytes(recorder)
                     recorder.clear()
+                    ts = int(time.time()*1000)
+                    dump_path = f"/tmp/inbound_{ts}.ulaw"
+                    with open(dump_path, "wb") as f:
+                        f.write(inbound_ulaw)
+                    logger.info("Detected end-of-turn: inbound bytes=%d dumped=%s", len(inbound_ulaw), dump_path)
 
-                    # Convert inbound μ-law 8k to WAV for ASR or storage
-                    try:
-                        seg = AudioSegment(
-                            # pydub expects raw_data plus parameters
-                            data=inbound_ulaw,
-                            sample_width=1, frame_rate=8000, channels=1
-                        )
-                        # convert to 16-bit PCM WAV temporary file for ASR usage if needed
-                        wav_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-                        seg = seg.set_frame_rate(16000).set_sample_width(2).set_channels(1)
-                        seg.export(wav_tmp.name, format="wav")
-                        wav_tmp.close()
-                    except Exception:
-                        logger.exception("Failed to export inbound segment to WAV (non-fatal)")
+                    # PLACEHOLDER ASR -> for now we set a placeholder text
+                    user_text = "(user speech detected)" 
+                    logger.info("Detected user_text (placeholder): %s", user_text)
 
-                    # Placeholder ASR/text extraction:
-                    user_text = "(user speech)"
-                    logger.info("Detected utterance (placeholder text): %s", user_text)
-
-                    # Get assistant reply (replace with your LLM/assistant call)
-                    reply_text = await llm_reply_stub(user_text)
+                    # Generate assistant reply text (replace with LLM)
+                    reply_text = f"I heard you. (placeholder reply to: {user_text})"
                     logger.info("Assistant reply text: %s", reply_text)
 
-                    # Synthesize TTS
-                    tts_bytes = make_tts(reply_text)
-                    if not tts_bytes:
-                        logger.warning("make_tts returned empty bytes; skipping playback")
-                        awaiting_tts = False
+                    # TTS
+                    tts = make_tts(reply_text)
+                    if not tts:
+                        logger.warning("make_tts returned empty bytes; skipping outbound playback")
+                        awaiting = False
                         continue
+                    logger.info("make_tts returned %d bytes", len(tts))
 
-                    # Convert TTS bytes to μ-law 8k
+                    # Convert to μ-law 8k (try pydub first, ffmpeg fallback)
                     try:
-                        ulaw_tts = convert_to_mulaw_8k_pydub(tts_bytes)
-                    except Exception:
+                        ulaw = convert_to_mulaw_pydub(tts) if HAS_PYDUB else convert_to_mulaw_ffmpeg(tts)
+                        logger.info("convert_to_mulaw_pydub succeeded size=%d", len(ulaw))
+                    except Exception as e:
+                        logger.warning("pydub conversion failed or not available: %s; trying ffmpeg", str(e))
                         try:
-                            ulaw_tts = convert_to_mulaw_8k_ffmpeg(tts_bytes)
+                            ulaw = convert_to_mulaw_ffmpeg(tts)
+                            logger.info("ffmpeg conversion succeeded size=%d", len(ulaw))
                         except Exception:
-                            logger.exception("Failed to convert TTS to μ-law 8k")
-                            awaiting_tts = False
+                            logger.exception("Both conversion methods failed; skipping playback")
+                            awaiting = False
                             continue
 
+                    # Stream outbound μ-law frames marked as outbound
                     if not stream_sid:
-                        logger.warning("No streamSid available; cannot send outbound audio")
-                        awaiting_tts = False
+                        logger.warning("No streamSid; cannot send outbound audio")
+                        awaiting = False
                         continue
 
-                    logger.info("Streaming outbound audio: %d bytes to streamSid=%s", len(ulaw_tts), stream_sid)
-
-                    # Stream outbound frames; allow barge-in: stop streaming if new inbound arrives
-                    sample_rate = 8000
-                    chunk_bytes = int(sample_rate * 0.02)  # 20 ms frames = 160 bytes
-                    frames_sent = 0
-                    offset = 0
-                    while offset < len(ulaw_tts):
-                        # barge-in detection — if caller started speaking again, stop playback
-                        if len(recorder) > 0:
-                            logger.info("Barge-in detected: inbound audio arrived while playing outbound. Stopping playback.")
-                            break
-
-                        chunk = ulaw_tts[offset:offset + chunk_bytes]
-                        offset += chunk_bytes
-                        payload_b64 = base64.b64encode(chunk).decode("ascii")
-                        frame = {
-                            "event": "media",
-                            "streamSid": stream_sid,
-                            "media": {
-                                "track": "outbound",
-                                "payload": payload_b64
-                            }
-                        }
-                        await ws.send_text(json.dumps(frame))
-                        frames_sent += 1
-                        if frames_sent % 25 == 0:
-                            logger.info("Sent %d frames (~%d ms) of outbound audio", frames_sent, frames_sent*20)
-                        await asyncio.sleep(0.02)
-                    logger.info("Finished outbound streaming: %d frames, %d bytes", frames_sent, len(ulaw_tts))
-
-                    # Optional: mark event so Twilio can correlate
-                    try:
-                        mark = {"event": "mark", "streamSid": stream_sid, "mark": {"name": f"reply-{int(time.time()*1000)}"}}
-                        await ws.send_text(json.dumps(mark))
-                    except Exception:
-                        logger.exception("Failed to send mark event")
+                    logger.info("Streaming outbound audio: %d bytes to streamSid=%s", len(ulaw), stream_sid)
+                    await stream_ulaw(ws, stream_sid, ulaw, frame_ms=20)
+                    logger.info("Outbound streaming complete")
 
                 except Exception:
-                    logger.exception("TURN handling failed")
+                    logger.exception("TURN processing failed")
                 finally:
-                    awaiting_tts = False
+                    awaiting = False
 
     except WebSocketDisconnect:
-        logger.info("WebSocket disconnected by client")
+        logger.info("WebSocket disconnected")
     except Exception:
         logger.exception("WebSocket handler error")
     finally:
@@ -306,10 +221,3 @@ async def twilio_media(ws: WebSocket):
         except Exception:
             pass
         logger.info("WS closed")
-
-# Run via `python ws_server.py` — reads PORT env var
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", "8000"))
-    logger.info("Starting server on 0.0.0.0:%d", port)
-    uvicorn.run("ws_server:app", host="0.0.0.0", port=port, log_level="info")
