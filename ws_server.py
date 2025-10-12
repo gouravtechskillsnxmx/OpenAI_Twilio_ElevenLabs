@@ -56,21 +56,32 @@ app = FastAPI(title="ws_server_fixed")
 # ---------------- utilities ----------------
 
 def make_tts(text: str) -> bytes:
-    """Return audio bytes (mp3 or wav). Use ElevenLabs if configured, else return audible WAV tone.
+    """Return audio bytes (mp3 or wav).
 
-    Audible fallback produces a short 440Hz tone so you can hear outbound playback during testing.
+    - Tries ElevenLabs when ELEVEN_API_KEY and ELEVEN_VOICE are set.
+    - If Eleven responds with non-2xx, logs status and body for diagnostics (shows exact error JSON).
+    - On exception or non-2xx, falls back to an audible test-tone WAV so you can verify playback.
     """
     if ELEVEN_API_KEY and ELEVEN_VOICE:
         try:
             url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE}"
-            headers = {"Accept": "audio/mpeg", "Content-Type": "application/json", "xi-api-key": ELEVEN_API_KEY}
+            headers = {
+                "Accept": "audio/mpeg",
+                "Content-Type": "application/json",
+                # strip whitespace just in case env var has trailing newline
+                "xi-api-key": ELEVEN_API_KEY.strip(),
+            }
             body = {"text": text, "voice_settings": {"stability": 0.3, "similarity_boost": 0.75}}
             r = requests.post(url, json=body, headers=headers, timeout=30)
-            r.raise_for_status()
-            logger.info("ElevenLabs TTS returned %d bytes", len(r.content))
-            return r.content
+            # explicit diagnostic logging on non-2xx so you can see Eleven's error JSON in logs
+            if 200 <= r.status_code < 300:
+                logger.info("ElevenLabs TTS OK (%d bytes)", len(r.content))
+                return r.content
+            else:
+                # log status and body for debugging (safe to paste here; do NOT paste your API key)
+                logger.error("ElevenLabs TTS failed status=%d body=%s", r.status_code, r.text)
         except Exception:
-            logger.exception("ElevenLabs TTS failed — falling back to audible tone")
+            logger.exception("ElevenLabs TTS exception — falling back to audible tone")
 
     # audible tone fallback (WAV PCM16 16000Hz ~0.6s, 440Hz)
     sr = 16000
