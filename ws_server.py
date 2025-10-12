@@ -47,6 +47,64 @@ logger = logging.getLogger("ws_server_fixed_forced_rest")
 
 app = FastAPI(title="ws_server_fixed_forced_rest")
 
+
+
+import os
+import logging
+from twilio.rest import Client
+from twilio.base.exceptions import TwilioRestException
+
+logger = logging.getLogger(__name__)
+
+
+if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
+    logger.error("TWILIO_ACCOUNT_SID or TWILIO_AUTH_TOKEN not set in environment")
+
+twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+
+
+def play_tts_if_in_progress(call_sid: str, tts_url: str) -> bool:
+    """
+    Try to redirect the live call to play the given TTS URL.
+    Returns True on success, False on any failure or if call not in-progress.
+    """
+    try:
+        call = twilio_client.calls(call_sid).fetch()
+    except TwilioRestException as e:
+        logger.exception("Failed to fetch call %s: %s", call_sid, e)
+        return False
+    except Exception as e:
+        logger.exception("Unexpected error fetching call %s: %s", call_sid, e)
+        return False
+
+    logger.info("Call %s status=%s", call_sid, getattr(call, "status", "<unknown>"))
+
+    if call.status != "in-progress":
+        logger.warning(
+            "Call not in-progress (status=%s) — skipping Twilio REST Play for %s",
+            call.status, call_sid
+        )
+        return False
+
+    twiml = f"<Response><Play>{tts_url}</Play></Response>"
+    try:
+        twilio_client.calls(call_sid).update(twiml=twiml)
+        logger.info("Successfully requested Twilio to play TTS for call %s", call_sid)
+        return True
+    except TwilioRestException as e:
+        # Twilio gives structured error info (e.g. 21220). Log it.
+        logger.warning(
+            "Twilio REST Play failed for call %s: status=%s code=%s msg=%s",
+            call_sid, getattr(e, "status", None), getattr(e, "code", None), getattr(e, "msg", str(e))
+        )
+        logger.debug("Twilio exception details:", exc_info=True)
+        return False
+    except Exception as e:
+        logger.exception("Unexpected error when updating call %s: %s", call_sid, e)
+        return False
+
+
+
 # ---------------- utilities ----------------
 
 def make_tts(text: str) -> bytes:
