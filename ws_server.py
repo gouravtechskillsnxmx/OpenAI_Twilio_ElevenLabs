@@ -1,10 +1,7 @@
-# ws_server_fixed.py
-# FORCED REST PLAY version — every assistant reply will be delivered via Twilio REST <Play>
-# This guarantees playback into the call (if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN are set)
-# Behavior changes vs earlier versions:
-# - After producing TTS bytes, the server will always upload/serve the WAV and instruct Twilio to <Play> it
-#   into the active call via REST API. This bypasses the websocket outbound streaming path.
-# - Useful when Media Stream websocket is unreliable or closed prematurely.
+# ws_server_patched.py
+# Patched version: adds play_tts_with_wait() wrapper which polls call status
+# and attempts SDK-based update when the call becomes in-progress. Falls back
+# to existing twilio_play_via_rest() if the SDK update fails.
 
 import os
 import sys
@@ -31,6 +28,10 @@ try:
 except Exception:
     HAS_PYDUB = False
 
+# twilio
+from twilio.rest import Client
+from twilio.base.exceptions import TwilioRestException
+
 # ---------- config ----------
 HOSTNAME = os.environ.get("HOSTNAME", "").strip()
 ELEVEN_API_KEY = os.environ.get("ELEVEN_API_KEY")
@@ -43,129 +44,92 @@ RECEIVE_TIMEOUT = float(os.environ.get("RECEIVE_TIMEOUT", "0.12"))
 MAX_BUFFER_BYTES = int(os.environ.get("MAX_BUFFER_BYTES", "16000"))
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger("ws_server_fixed_forced_rest")
+logger = logging.getLogger("ws_server_patched")
 
-app = FastAPI(title="ws_server_fixed_forced_rest")
-
-
-
-import os
-import logging
-from twilio.rest import Client
-from twilio.base.exceptions import TwilioRestException
-
-logger = logging.getLogger(__name__)
-
+app = FastAPI(title="ws_server_patched")
 
 if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
-    logger.error("TWILIO_ACCOUNT_SID or TWILIO_AUTH_TOKEN not set in environment")
+    logger.warning("TWILIO_ACCOUNT_SID or TWILIO_AUTH_TOKEN not set in environment")
 
-twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+# Twilio client (SDK)
+try:
+    twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+except Exception:
+    twilio_client = None
 
 
-def play_tts_if_in_progress(call_sid: str, tts_url: str) -> bool:
+# ---------------- Twilio SDK wrapper with poll/retry ----------------
+def play_tts_with_wait(call_sid: str, tts_url: str, wait_timeout: float = 5.0, poll_interval: float = 0.5) -> bool:
     """
-    Try to redirect the live call to play the given TTS URL.
-    Returns True on success, False on any failure or if call not in-progress.
+    Try to play TTS into an active call via the Twilio SDK 'update(twiml=...)'.
+
+    Behavior:
+      - Polls the call status (via SDK) until it becomes 'in-progress' or wait_timeout expires.
+      - When status='in-progress', performs client.calls(call_sid).update(twiml=...) once.
+      - If SDK isn't available or the fetch/update fails, returns False.
+
+    Returns True if SDK update succeeded, False otherwise.
     """
+    if not twilio_client:
+        logger.debug("Twilio SDK client not available; skipping play_tts_with_wait")
+        return False
+
+    deadline = time.time() + wait_timeout
+    last_status = None
+
     try:
-        call = twilio_client.calls(call_sid).fetch()
-    except TwilioRestException as e:
-        logger.exception("Failed to fetch call %s: %s", call_sid, e)
+        # Poll loop: fetch status until in-progress or timeout
+        while time.time() < deadline:
+            try:
+                call = twilio_client.calls(call_sid).fetch()
+            except TwilioRestException as e:
+                logger.debug("Twilio fetch failed while polling for in-progress: %s", e)
+                # If we get a structured Twilio error that indicates not found or not fetchable,
+                # don't hammer the API; break to let fallback handle.
+                last_status = None
+                break
+            except Exception as e:
+                logger.exception("Unexpected error fetching call %s while waiting: %s", call_sid, e)
+                break
+
+            status = getattr(call, "status", None)
+            last_status = status
+            logger.info("play_tts_with_wait: call %s current status=%s (deadline in %.1fs)", call_sid, status, max(0.0, deadline - time.time()))
+
+            if status == "in-progress":
+                twiml = f"<Response><Play>{tts_url}</Play></Response>"
+                try:
+                    twilio_client.calls(call_sid).update(twiml=twiml)
+                    logger.info("play_tts_with_wait: SDK update succeeded for call %s", call_sid)
+                    return True
+                except TwilioRestException as e:
+                    # 21220 or similar may be returned here as well; log structured fields
+                    logger.warning("play_tts_with_wait: SDK update failed for call %s: status=%s code=%s msg=%s",
+                                   call_sid, getattr(e, "status", None), getattr(e, "code", None), getattr(e, "msg", str(e)))
+                    logger.debug("Twilio exception details:", exc_info=True)
+                    return False
+                except Exception as e:
+                    logger.exception("play_tts_with_wait: unexpected exception updating call %s: %s", call_sid, e)
+                    return False
+
+            # not in-progress yet — wait then retry
+            time.sleep(poll_interval)
+
+    except Exception:
+        logger.exception("Error in play_tts_with_wait polling loop")
         return False
-    except Exception as e:
-        logger.exception("Unexpected error fetching call %s: %s", call_sid, e)
-        return False
 
-    logger.info("Call %s status=%s", call_sid, getattr(call, "status", "<unknown>"))
-
-    if call.status != "in-progress":
-        logger.warning(
-            "Call not in-progress (status=%s) — skipping Twilio REST Play for %s",
-            call.status, call_sid
-        )
-        return False
-
-    twiml = f"<Response><Play>{tts_url}</Play></Response>"
-    try:
-        twilio_client.calls(call_sid).update(twiml=twiml)
-        logger.info("Successfully requested Twilio to play TTS for call %s", call_sid)
-        return True
-    except TwilioRestException as e:
-        # Twilio gives structured error info (e.g. 21220). Log it.
-        logger.warning(
-            "Twilio REST Play failed for call %s: status=%s code=%s msg=%s",
-            call_sid, getattr(e, "status", None), getattr(e, "code", None), getattr(e, "msg", str(e))
-        )
-        logger.debug("Twilio exception details:", exc_info=True)
-        return False
-    except Exception as e:
-        logger.exception("Unexpected error when updating call %s: %s", call_sid, e)
-        return False
+    logger.info("play_tts_with_wait: timed out waiting for in-progress (last_status=%s)", last_status)
+    return False
 
 
-
-# ---------------- utilities ----------------
-
-def make_tts(text: str) -> bytes:
-    """Try ElevenLabs TTS; on failure return audible WAV tone. Logs response body for diagnostics."""
-    if ELEVEN_API_KEY and ELEVEN_VOICE:
-        try:
-            url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE}"
-            headers = {"Accept": "audio/mpeg", "Content-Type": "application/json", "xi-api-key": ELEVEN_API_KEY.strip()}
-            body = {"text": text, "voice_settings": {"stability": 0.3, "similarity_boost": 0.75}}
-            r = requests.post(url, json=body, headers=headers, timeout=30)
-            if 200 <= r.status_code < 300:
-                logger.info("ElevenLabs TTS OK (%d bytes)", len(r.content))
-                return r.content
-            else:
-                logger.error("ElevenLabs TTS failed status=%d body=%s", r.status_code, r.text)
-        except Exception:
-            logger.exception("ElevenLabs TTS exception — falling back to audible tone")
-
-    # audible tone fallback WAV (PCM16 16000Hz ~0.6s, 440Hz)
-    sr = 16000
-    duration = 0.6
-    nframes = int(sr * duration)
-    buf = io.BytesIO()
-    wf = wave.open(buf, 'wb')
-    wf.setnchannels(1)
-    wf.setsampwidth(2)
-    wf.setframerate(sr)
-    import math
-    amplitude = 12000
-    for i in range(nframes):
-        t = i / sr
-        sample = int(amplitude * math.sin(2 * math.pi * 440 * t))
-        wf.writeframes(struct.pack('<h', sample))
-    wf.close()
-    data = buf.getvalue()
-    logger.info("Returning audible test-tone WAV (%d bytes) from make_tts", len(data))
-    return data
-
-
-def convert_to_mulaw_ffmpeg(input_bytes: bytes) -> bytes:
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", "pipe:0", "-ar", "8000", "-ac", "1", "-f", "mulaw", "pipe:1"]
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    out, err = proc.communicate(input=input_bytes)
-    if proc.returncode != 0:
-        logger.error("ffmpeg conversion failed: %s", err.decode('utf-8', errors='ignore'))
-        raise RuntimeError("ffmpeg conversion failed")
-    return out
-
-
-def convert_to_mulaw_pydub(input_bytes: bytes) -> bytes:
-    if not HAS_PYDUB:
-        raise RuntimeError("pydub not available")
-    seg = AudioSegment.from_file_using_temporary_files(io.BytesIO(input_bytes))
-    seg = seg.set_frame_rate(8000).set_channels(1).set_sample_width(2)
-    pcm16 = seg.raw_data
-    ulaw = audioop.lin2ulaw(pcm16, 2)
-    return ulaw
-
+# ---------------- Existing fallback: save file and POST TwiML via REST ----------------
 
 def twilio_play_via_rest(call_sid: str, tts_bytes: bytes) -> bool:
-    """Save tts_bytes to /tmp and POST TwiML <Play> to call via Twilio REST. Requires TWILIO_* env vars."""
+    """
+    Save tts_bytes to /tmp and POST TwiML <Play> to call via Twilio REST (requests.post).
+    This is the fallback used when SDK-update approach fails.
+    """
     if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN):
         logger.warning("TWILIO_ACCOUNT_SID/AUTH_TOKEN not set; cannot REST Play")
         return False
@@ -193,29 +157,44 @@ def twilio_play_via_rest(call_sid: str, tts_bytes: bytes) -> bool:
         logger.exception("Twilio REST Play fallback failed")
         return False
 
-# Serve TTS files for Twilio to fetch
-from fastapi.responses import FileResponse
 
-@app.get("/tts/{fname}")
-async def serve_tts(fname: str):
-    path = f"/tmp/{fname}"
-    if not os.path.exists(path):
-        raise HTTPException(status_code=404, detail="Not found")
-    logger.info("Serving TTS file %s", path)
-    return FileResponse(path, media_type="audio/wav")
+# ---------------- small utilities (TTS, conversion) ----------------
+def make_tts(text: str) -> bytes:
+    if ELEVEN_API_KEY and ELEVEN_VOICE:
+        try:
+            url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE}"
+            headers = {"Accept": "audio/mpeg", "Content-Type": "application/json", "xi-api-key": ELEVEN_API_KEY}
+            body = {"text": text, "voice_settings": {"stability": 0.3, "similarity_boost": 0.75}}
+            r = requests.post(url, json=body, headers=headers, timeout=30)
+            if 200 <= r.status_code < 300:
+                logger.info("ElevenLabs TTS OK (%d bytes)", len(r.content))
+                return r.content
+            else:
+                logger.error("ElevenLabs TTS failed status=%d body=%s", r.status_code, r.text)
+        except Exception:
+            logger.exception("ElevenLabs TTS exception — falling back to empty bytes")
+    return b""
 
-# health
-@app.get("/health")
-async def health():
-    return {"ok": True, "hostname": HOSTNAME}
 
-# ---------------- processing (FORCE REST PLAY) ----------------
+# simplified mp3/wav -> raw ulaw helper (uses pydub if available)
+def mp3_or_wav_bytes_to_raw_mulaw_8k(tts_bytes: bytes) -> bytes:
+    if not HAS_PYDUB:
+        # naive fallback — try ffmpeg conversion
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", "pipe:0", "-ar", "8000", "-ac", "1", "-f", "mulaw", "pipe:1"]
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out, err = proc.communicate(input=tts_bytes)
+        if proc.returncode != 0:
+            raise RuntimeError("ffmpeg conversion failed: %s" % err.decode('utf-8', errors='ignore'))
+        return out
+    seg = AudioSegment.from_file_using_temporary_files(io.BytesIO(tts_bytes))
+    seg = seg.set_frame_rate(8000).set_channels(1).set_sample_width(2)
+    pcm16 = seg.raw_data
+    ulaw = audioop.lin2ulaw(pcm16, 2)
+    return ulaw
 
-async def llm_reply_stub(text: str) -> str:
-    return "I heard you. (echo)"
 
+# ---------------- processing flow: use wrapper then fallback ----------------
 async def process_turn_force_rest(ws: WebSocket, stream_sid: str, call_sid: Optional[str], inbound_ulaw: bytes, recorder_ref: bytearray):
-    """Process one user turn and force Twilio REST Play for playback into the call."""
     try:
         ts = int(time.time() * 1000)
         dump_path = f"/tmp/inbound_{ts}.ulaw"
@@ -226,22 +205,35 @@ async def process_turn_force_rest(ws: WebSocket, stream_sid: str, call_sid: Opti
         user_text = "(user speech)"
         logger.info("ASR placeholder text: %s", user_text)
 
-        reply_text = await llm_reply_stub(user_text)
+        # Use very small stub LLM reply here; replace with your llm call
+        reply_text = "I heard you. (echo)"
         logger.info("Assistant reply text: %s", reply_text)
 
-        # Synthesize TTS (mp3/wav bytes)
         tts_bytes = make_tts(reply_text)
         if not tts_bytes:
             logger.warning("make_tts returned empty bytes; skipping REST Play")
             return
-        logger.info("make_tts returned %d bytes", len(tts_bytes))
 
-        # Force REST Play into call
-        if not call_sid:
-            logger.warning("No call_sid available; cannot force REST Play")
-            return
-        ok = twilio_play_via_rest(call_sid, tts_bytes)
-        if ok:
+        # Save to an accessible URL path for Twilio to fetch
+        ts2 = int(time.time() * 1000)
+        fname = f"tts_{call_sid}_{ts2}.wav"
+        path = f"/tmp/{fname}"
+        with open(path, "wb") as f:
+            f.write(tts_bytes)
+        tts_url = f"https://{HOSTNAME}/tts/{fname}"
+
+        # 1) Try SDK update with polling/wait
+        if call_sid:
+            ok = play_tts_with_wait(call_sid, tts_url, wait_timeout=5.0, poll_interval=0.5)
+            if ok:
+                logger.info("play_tts_with_wait succeeded for callSid=%s", call_sid)
+                return
+            else:
+                logger.warning("play_tts_with_wait failed or timed out for callSid=%s — falling back to REST POST", call_sid)
+
+        # 2) Fallback: POST TwiML via REST (requests)
+        fallback_ok = twilio_play_via_rest(call_sid or "", tts_bytes)
+        if fallback_ok:
             logger.info("Twilio REST Play forced successfully for callSid=%s", call_sid)
         else:
             logger.warning("Twilio REST Play forced but failed for callSid=%s", call_sid)
@@ -249,23 +241,27 @@ async def process_turn_force_rest(ws: WebSocket, stream_sid: str, call_sid: Opti
     except Exception:
         logger.exception("process_turn_force_rest failed")
 
-# ---------------- TwiML / websocket handler ----------------
-@app.api_route("/twiml_stream", methods=["GET", "POST"])
-async def twiml_stream(request: Request):
-    if not HOSTNAME:
-        xml = "<Response><Say voice='alice'>Server hostname not configured. Please set HOSTNAME environment variable.</Say></Response>"
-        logger.warning("HOSTNAME missing; returning debug TwiML")
-        return Response(content=xml, media_type="text/xml")
-    ws_url = f"wss://{HOSTNAME}/twilio-media"
-    twiml = (
-        "<Response>"
-        f"<Start><Stream url=\"{ws_url}\" track=\"both\"/></Start>"
-        "<Say voice='alice'>Hi — connecting you now. Please wait.</Say>"
-        "<Pause length='600'/>"
-        "</Response>"
-    )
-    logger.info("Returning TwiML: %s", twiml)
-    return Response(content=twiml, media_type="text/xml")
+
+# ---------------- Serve TTS files ----------------
+from fastapi.responses import FileResponse
+
+@app.get("/tts/{fname}")
+async def serve_tts(fname: str):
+    path = f"/tmp/{fname}"
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Not found")
+    logger.info("Serving TTS file %s", path)
+    return FileResponse(path, media_type="audio/wav")
+
+
+# Health
+@app.get("/health")
+async def health():
+    return {"ok": True, "hostname": HOSTNAME}
+
+
+# Minimal WS handler (keeps the same forced-rest processing trigger points as before)
+PAUSE_MS = int(os.environ.get("PAUSE_MS", "700"))
 
 @app.websocket("/twilio-media")
 async def twilio_media(ws: WebSocket):
@@ -352,9 +348,9 @@ async def twilio_media(ws: WebSocket):
             pass
         logger.info("WS closed")
 
-# run server
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", "8000"))
     logger.info("Starting server on 0.0.0.0:%d", port)
-    uvicorn.run("ws_server_fixed_forced_rest:app", host="0.0.0.0", port=port, log_level="info")
+    uvicorn.run("ws_server_patched:app", host="0.0.0.0", port=port, log_level="info")
