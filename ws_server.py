@@ -1,4 +1,4 @@
-# ws_server_patched.py
+# ws_server.py
 # Patched version: adds play_tts_with_wait() wrapper which polls call status
 # and attempts SDK-based update when the call becomes in-progress. Falls back
 # to existing twilio_play_via_rest() if the SDK update fails.
@@ -353,4 +353,4 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", "8000"))
     logger.info("Starting server on 0.0.0.0:%d", port)
-    uvicorn.run("ws_server_patched:app", host="0.0.0.0", port=port, log_level="info")
+    uvicorn.run("ws_server:app", host="0.0.0.0", port=port, log_level="info")
