@@ -418,6 +418,27 @@ async def handle_playback_for_call(call_sid: str, tts_bytes: bytes) -> bool:
         logger.warning("handle_playback_for_call: playback could not be triggered for call %s", call_sid)
     return ok
 
+@app.get("/debug/markers")
+async def list_markers():
+    """Return list of recent marker files and contents (for debugging via Postman)."""
+    import glob, json, os, pathlib, time
+    files = sorted(glob.glob("/tmp/ws_*.json"), key=os.path.getmtime, reverse=True)
+    latest = []
+    for f in files[:10]:  # limit to 10 newest
+        try:
+            stat = os.stat(f)
+            with open(f) as fp:
+                data = json.load(fp)
+            latest.append({
+                "name": pathlib.Path(f).name,
+                "size": stat.st_size,
+                "mtime": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(stat.st_mtime)),
+                "data": data
+            })
+        except Exception as e:
+            latest.append({"name": f, "error": str(e)})
+    return {"count": len(latest), "markers": latest}
+
 
 # If run directly, start uvicorn for local dev.
 if __name__ == "__main__":
