@@ -341,6 +341,14 @@ async def twilio_media_ws(ws: WebSocket):
                     }
                     write_marker("ws_connected", call_sid, marker_payload)
                     logger.info("INBOUND stream started msg_count=%d callSid=%s -> wrote marker ws_connected_%s.json", msg_count, call_sid, call_sid)
+                
+                    try:
+                        twiml = f"<Response><Play>{TEST_AUDIO_URL}</Play></Response>"
+                        twilio_client.calls(call_sid).update(twiml=twiml)
+                        logger.info("Queued welcome message for %s", call_sid)
+                    except Exception:
+                        logger.exception("Failed to queue welcome playback for %s", call_sid)
+                # --- end of welcome message block ---
                 else:
                     marker_name = f"{ts2}"
                     write_marker("ws_start", marker_name, {"timestamp": now_iso(), "start_payload": start_payload, "msg_count": msg_count})
