@@ -25,6 +25,7 @@ from fastapi import FastAPI, Request, WebSocket, HTTPException
 from fastapi.responses import PlainTextResponse, FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from twilio.rest import Client as TwilioClient
+from starlette.websockets import WebSocketDisconnect
 
 # --- Configuration ----------------------------------------------------------
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
@@ -100,6 +101,18 @@ def write_marker(prefix: str, name: str, payload: dict):
     except Exception as ex:
         logger.exception("write_marker: failed to write marker %s_%s: %s", prefix, name, ex)
         return None
+
+# --- NEW: safe websocket close helper (single change: replace await ws.close() calls with this) ---
+async def safe_close_ws(ws: WebSocket):
+    """Attempt to close the websocket but ignore the RuntimeError raised if ASGI already closed it."""
+    try:
+        await ws.close()
+    except RuntimeError as e:
+        # This is expected in races where the ASGI layer already sent websocket.close
+        logger.debug("safe_close_ws: ws.close() raised RuntimeError (already closed?): %s", e)
+    except Exception as e:
+        # Log unexpected closing errors with stack
+        logger.exception("safe_close_ws: unexpected exception while closing websocket: %s", e)
 
 # --- Twilio REST helpers --------------------------------------------------
 async def call_get_status(call_sid: str) -> Optional[str]:
@@ -355,10 +368,11 @@ async def twilio_media_ws(ws: WebSocket):
         logger.info("WS closed unexpectedly: %s", ex)
         logger.debug("twilio_media_ws: traceback: %s", traceback.format_exc())
     finally:
+        # REPLACED direct await ws.close() with safe_close_ws(ws)
         try:
-            await ws.close()
+            await safe_close_ws(ws)
         except Exception:
-            logger.exception("Error closing websocket")
+            logger.exception("Error in safe_close_ws")
         logger.info("WS closed (handler exit) total_msgs=%d", msg_count)
 
 
