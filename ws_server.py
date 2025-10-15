@@ -108,6 +108,44 @@ app.mount("/tts_static", StaticFiles(directory=str(TTS_DIR)), name="tts_static")
 
 
 # --- Helpers ---------------------------------------------------------
+
+import asyncio
+from twilio.base.exceptions import TwilioRestException
+
+# Make sure `twilio_client` is your Twilio REST client instance already created
+# e.g. from twilio.rest import Client
+# twilio_client = Client(ACCOUNT_SID, AUTH_TOKEN)
+
+async def play_welcome_async(call_sid: str, audio_url: str = None, text: str | None = None):
+    """
+    Play a welcome audio or TTS into an existing live Twilio call.
+
+    - If `audio_url` is provided we send <Play>{audio_url}</Play>.
+    - Else if `text` provided we send <Say>{text}</Say>.
+    - This uses asyncio.to_thread to avoid blocking the event loop.
+    """
+    if not call_sid:
+        return
+
+    if audio_url:
+        twiml = f"<Response><Play>{audio_url}</Play></Response>"
+    elif text:
+        # Use Say for TTS; you can use voice attribute as needed
+        safe_text = (text.replace("&", "&amp;")
+                         .replace("<", "&lt;")
+                         .replace(">", "&gt;"))
+        twiml = f'<Response><Say voice="Polly.Joanna">{safe_text}</Say></Response>'
+    else:
+        return
+
+    try:
+        # Run the synchronous Twilio REST call off the event loop
+        await asyncio.to_thread(twilio_client.calls(call_sid).update, twiml=twiml)
+    except TwilioRestException as e:
+        logger.exception("Twilio REST error while queuing welcome for %s: %s", call_sid, e)
+    except Exception:
+        logger.exception("Failed to queue welcome playback for %s", call_sid)
+
 def now_iso():
     return datetime.utcnow().isoformat() + "Z"
 
@@ -386,6 +424,8 @@ async def twilio_media_ws(ws: WebSocket):
                         "msg_count": msg_count
                     }
                     write_marker("ws_connected", call_sid, marker_payload)
+                    asyncio.create_task(play_welcome_async(call_sid, text="Welcome to the AI assistant. Please say something."))
+
                      # simple: reply with pre-defined text
                     try:
                         user_text = "Hello there! This is your AI voice assistant speaking from OpenAI and ElevenLabs."
