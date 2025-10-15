@@ -49,6 +49,13 @@ import requests
 openai.api_key = os.getenv("OPENAI_API_KEY")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 
+import asyncio
+
+async def queue_playback_async(call_sid: str, text_or_url: str):
+    twiml = f'<Response><Say>{text_or_url}</Say></Response>'
+    # run blocking SDK call in a thread:
+    await asyncio.to_thread(twilio_client.calls(call_sid).update, twiml)
+
 def reply_via_tts_and_play(call_sid: str, user_text: str, tts_voice_id="alloy"):
     """Synchronous: get chat reply from OpenAI, convert to audio via ElevenLabs, then tell Twilio to play it."""
     try:
@@ -111,6 +118,20 @@ app.mount("/tts_static", StaticFiles(directory=str(TTS_DIR)), name="tts_static")
 
 import asyncio
 from twilio.base.exceptions import TwilioRestException
+
+import threading
+
+def queue_playback(call_sid: str, audio_url_or_twiml: str):
+    # this runs the blocking Twilio client call in a separate thread
+    def _update():
+        # if you want a Play URL:
+        twiml = f'<Response><Play>{audio_url_or_twiml}</Play></Response>'
+        # or if you want Say:
+        # twiml = f'<Response><Say>{audio_url_or_twiml}</Say></Response>'
+        twilio_client.calls(call_sid).update(twiml=twiml)
+
+    threading.Thread(target=_update, daemon=True).start()
+
 
 # Make sure `twilio_client` is your Twilio REST client instance already created
 # e.g. from twilio.rest import Client
@@ -320,10 +341,10 @@ async def twiml_stream(request: Request):
     stream_url = f"wss://{host}/twilio-media"
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
+  <Say voice="Polly.Joanna">Connecting you to your AI assistant...</Say>
   <Start>
     <Stream url="wss://openai-twilio-elevenlabs.onrender.com/twilio-media" />
   </Start>
-  <Say voice="Polly.Joanna">Connecting you to your AI assistant...</Say>
 </Response>
 """
     logger.info("twiml_stream: Returning TwiML Start/Stream -> %s for call %s twiml_len=%d", stream_url, call_sid, len(twiml))
@@ -424,7 +445,9 @@ async def twilio_media_ws(ws: WebSocket):
                         "msg_count": msg_count
                     }
                     write_marker("ws_connected", call_sid, marker_payload)
-                    asyncio.create_task(play_welcome_async(call_sid, text="Welcome to the AI assistant. Please say something."))
+                    #asyncio.create_task(play_welcome_async(call_sid, text="Welcome to the AI assistant. Please say something."))
+                    # schedule it (don't await)
+                    asyncio.create_task(queue_playback_async(call_sid, "Hello — connecting you now"))
 
                      # simple: reply with pre-defined text
                     try:
