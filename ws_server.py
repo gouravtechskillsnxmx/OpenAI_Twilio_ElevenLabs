@@ -283,9 +283,11 @@ async def twiml_stream(request: Request):
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Start>
-    <Stream url="{stream_url}"/>
+    <Stream url="wss://openai-twilio-elevenlabs.onrender.com/twilio-media" />
   </Start>
-</Response>"""
+  <Say voice="Polly.Joanna">Connecting you to your AI assistant...</Say>
+</Response>
+"""
     logger.info("twiml_stream: Returning TwiML Start/Stream -> %s for call %s twiml_len=%d", stream_url, call_sid, len(twiml))
     return Response(content=twiml, media_type="application/xml")
 
