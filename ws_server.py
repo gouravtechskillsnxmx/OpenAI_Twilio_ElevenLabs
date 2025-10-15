@@ -43,6 +43,50 @@ if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
 
 twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
+import openai
+import requests
+
+openai.api_key = os.getenv("OPENAI_API_KEY")
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+
+def reply_via_tts_and_play(call_sid: str, user_text: str, tts_voice_id="alloy"):
+    """Synchronous: get chat reply from OpenAI, convert to audio via ElevenLabs, then tell Twilio to play it."""
+    try:
+        # 1) ask OpenAI
+        resp = openai.ChatCompletion.create(
+            model="gpt-4o-mini",
+            messages=[{"role":"system","content":"You are a helpful voice assistant."},
+                      {"role":"user","content":user_text}],
+            max_tokens=300
+        )
+        reply_text = resp.choices[0].message.content.strip()
+
+        # 2) generate TTS via ElevenLabs (example POST; adapt per their API)
+        tts_url = None
+        eleven_url = "https://api.elevenlabs.io/v1/text-to-speech/" + tts_voice_id
+        headers = {"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"}
+        tts_payload = {"text": reply_text, "voice_settings": {"stability":0.5, "similarity_boost":0.75}}
+        r = requests.post(eleven_url, json=tts_payload, headers=headers)
+        if r.status_code == 200:
+            # ElevenLabs returns audio bytes — you should upload them to a public URL (S3) or serve via your app.
+            # For simplicity, here we'll save to /tmp and serve from /tts_static if you added that route.
+            audio_bytes = r.content
+            filename = f"/tmp/tts_{call_sid}.mp3"
+            with open(filename, "wb") as f:
+                f.write(audio_bytes)
+            # Publicly accessible URL for the file; adapt to your domain + static route
+            tts_url = f"{PUBLIC_BASE_URL}/tts_static/{os.path.basename(filename)}"
+        else:
+            logger.error("ElevenLabs TTS failed %s %s", r.status_code, r.text)
+
+        if tts_url:
+            twiml = f"<Response><Play>{tts_url}</Play></Response>"
+            twilio_client.calls(call_sid).update(twiml=twiml)
+            logger.info("Queued TTS reply for %s", call_sid)
+    except Exception:
+        logger.exception("reply_via_tts_and_play failed for %s", call_sid)
+
+
 # --- Logging ----------------------------------------------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s pid=%(process)d tid=%(thread)d %(name)s %(message)s")
 logger = logging.getLogger("ws_server_full")
@@ -340,6 +384,23 @@ async def twilio_media_ws(ws: WebSocket):
                         "msg_count": msg_count
                     }
                     write_marker("ws_connected", call_sid, marker_payload)
+                     # simple: reply with pre-defined text
+                    try:
+                        user_text = "Hello there! This is your AI voice assistant speaking from OpenAI and ElevenLabs."
+                        reply_via_tts_and_play(call_sid, user_text)
+                    except Exception:
+                        logger.exception("Failed to initiate TTS reply for %s", call_sid)   
+                    # --- play a short welcome message right after call starts ---
+                    try:
+                        # use TEST_AUDIO_URL env var. If not set, change the default at module top.
+                        twiml = f"<Response><Play>{TEST_AUDIO_URL}</Play></Response>"
+                        # This is synchronous and simple — Twilio REST call to push TwiML to live call
+                        twilio_client.calls(call_sid).update(twiml=twiml)
+                        logger.info("Queued welcome message for %s", call_sid)
+                    except Exception:
+                        logger.exception("Failed to queue welcome playback for %s", call_sid)
+                    # --- end welcome block ---
+
                     logger.info("INBOUND stream started msg_count=%d callSid=%s -> wrote marker ws_connected_%s.json", msg_count, call_sid, call_sid)
                 
                     try:
