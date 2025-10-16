@@ -28,8 +28,8 @@ from twilio.rest import Client as TwilioClient
 from starlette.websockets import WebSocketDisconnect
 
 # --- Configuration ----------------------------------------------------------
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID","AC0a8a61a986fb956f2eb7e86166a65f25")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN","c1a59fb968147b1659bd8438a5c3f7fd")
 BASE_URL = os.getenv("BASE_URL", "https://openai-twilio-elevenlabs.onrender.com")
 TTS_DIR = Path(os.getenv("TTS_DIR", "/tmp"))
 MARKER_DIR = Path(os.getenv("MARKER_DIR", "/tmp"))
@@ -343,7 +343,7 @@ async def twiml_stream(request: Request):
 <Response>
   <Say voice="Polly.Joanna">Connecting you to your AI assistant...</Say>
   <Start>
-    <Stream url="wss://openai-twilio-elevenlabs.onrender.com/twilio-media" />
+    <Stream url="wss://7be9ebe6a889.ngrok-free.app/twilio-media" />
   </Start>
 </Response>
 """
@@ -591,5 +591,5 @@ async def list_markers():
 # If run directly, start uvicorn for local dev.
 if __name__ == "__main__":
     import uvicorn
-    logger.info("Starting ws_server_full_logging uvicorn app on port %s pid=%d", os.getenv("PORT", "10000"), os.getpid())
-    uvicorn.run("ws_server_full_logging:app", host="0.0.0.0", port=int(os.getenv("PORT", "10000")), log_level="info")
+    logger.info("Starting ws_server uvicorn app on port %s pid=%d", os.getenv("PORT", "10000"), os.getpid())
+    uvicorn.run("ws_server:app", host="0.0.0.0", port=int(os.getenv("PORT", "10000")), log_level="info")
