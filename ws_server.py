@@ -28,8 +28,8 @@ from twilio.rest import Client as TwilioClient
 from starlette.websockets import WebSocketDisconnect
 
 # --- Configuration ----------------------------------------------------------
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID","AC0a8a61a986fb956f2eb7e86166a65f25")
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN","c1a59fb968147b1659bd8438a5c3f7fd")
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 BASE_URL = os.getenv("BASE_URL", "https://openai-twilio-elevenlabs.onrender.com")
 TTS_DIR = Path(os.getenv("TTS_DIR", "/tmp"))
 MARKER_DIR = Path(os.getenv("MARKER_DIR", "/tmp"))
@@ -593,3 +593,4 @@ if __name__ == "__main__":
     import uvicorn
     logger.info("Starting ws_server uvicorn app on port %s pid=%d", os.getenv("PORT", "10000"), os.getpid())
     uvicorn.run("ws_server:app", host="0.0.0.0", port=int(os.getenv("PORT", "10000")), log_level="info")
+
