@@ -343,7 +343,7 @@ async def twiml_stream(request: Request):
 <Response>
   <Say voice="Polly.Joanna">Connecting you to your AI assistant...</Say>
   <Start>
-    <Stream url="wss://fdddf078ca76.ngrok-free.app/twilio-media" />
+    <Stream url="wss://1bc9f559ec09.ngrok-free.app/twilio-media" />
   </Start>
 </Response>
 """
@@ -593,5 +593,6 @@ if __name__ == "__main__":
     import uvicorn
     logger.info("Starting ws_server uvicorn app on port %s pid=%d", os.getenv("PORT", "10000"), os.getpid())
     uvicorn.run("ws_server:app", host="0.0.0.0", port=int(os.getenv("PORT", "10000")), log_level="info")
+
 
 
