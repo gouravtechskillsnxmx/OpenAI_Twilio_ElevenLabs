@@ -1,601 +1,229 @@
-"""
-ws_server_full_logging.py - Highly instrumented Twilio Media + TTS server to aid RCA.
-Features:
- - Detailed logging of incoming /twiml_stream webhooks (form + headers, redacted)
- - Twilio REST fetch/update timing and safe repr dumps
- - TTS file write with fsync and serve endpoint
- - WebSocket handler that logs ASGI scope (handshake headers), writes marker files on accept and on 'start' event,
-   logs media/stop events and writes additional markers for troubleshooting
- - Health endpoints and a fallback TwiML <Play> endpoint to test audio delivery without websockets
- - Minimal behavioral changes (no functional change to how call redirect works) — only extra logging and markers
-"""
+# ws_server.py
+# Patched version — key changes:
+#  - Read Twilio credentials from environment and fail fast if missing.
+#  - Read NGROK_HOST or PUBLIC_HOST from environment (so you don't have to edit code each time ngrok changes).
+#  - Build Stream URL using the host env var and ensure correct scheme (wss://).
+#  - Improved logging and clearer Twilio exception handling to avoid "Task exception was never retrieved"
+#  - Minimal, self-contained server bits (adapt to your original code as needed).
 
 import os
 import asyncio
 import logging
 import json
-import time
-import traceback
-import threading
-from datetime import datetime, timedelta
+import base64
 from pathlib import Path
-from typing import Optional
+from datetime import datetime
 
-from fastapi import FastAPI, Request, WebSocket, HTTPException
-from fastapi.responses import PlainTextResponse, FileResponse, Response
-from fastapi.staticfiles import StaticFiles
-from twilio.rest import Client as TwilioClient
-from starlette.websockets import WebSocketDisconnect
-
-# --- Configuration ----------------------------------------------------------
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-BASE_URL = os.getenv("BASE_URL", "https://openai-twilio-elevenlabs.onrender.com")
-TTS_DIR = Path(os.getenv("TTS_DIR", "/tmp"))
-MARKER_DIR = Path(os.getenv("MARKER_DIR", "/tmp"))
-POLL_INTERVAL_SECONDS = float(os.getenv("POLL_INTERVAL_SECONDS", "0.5"))
-POLL_TIMEOUT_SECONDS = float(os.getenv("POLL_TIMEOUT_SECONDS", "5.0"))
-TEST_AUDIO_URL = os.getenv("TEST_AUDIO_URL", "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3")
-
-# Validate env vars
-if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
-    raise RuntimeError("TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN environment variables must be set.")
-
-twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-
-import openai
-import requests
-
-openai.api_key = os.getenv("OPENAI_API_KEY")
-ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
-
-import asyncio
-
-async def queue_playback_async(call_sid: str, text_or_url: str):
-    twiml = f'<Response><Say>{text_or_url}</Say></Response>'
-    # run blocking SDK call in a thread:
-    await asyncio.to_thread(twilio_client.calls(call_sid).update, twiml)
-
-def reply_via_tts_and_play(call_sid: str, user_text: str, tts_voice_id="alloy"):
-    """Synchronous: get chat reply from OpenAI, convert to audio via ElevenLabs, then tell Twilio to play it."""
-    try:
-        # 1) ask OpenAI
-        resp = openai.ChatCompletion.create(
-            model="gpt-4o-mini",
-            messages=[{"role":"system","content":"You are a helpful voice assistant."},
-                      {"role":"user","content":user_text}],
-            max_tokens=300
-        )
-        reply_text = resp.choices[0].message.content.strip()
-
-        # 2) generate TTS via ElevenLabs (example POST; adapt per their API)
-        tts_url = None
-        eleven_url = "https://api.elevenlabs.io/v1/text-to-speech/" + tts_voice_id
-        headers = {"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"}
-        tts_payload = {"text": reply_text, "voice_settings": {"stability":0.5, "similarity_boost":0.75}}
-        r = requests.post(eleven_url, json=tts_payload, headers=headers)
-        if r.status_code == 200:
-            # ElevenLabs returns audio bytes — you should upload them to a public URL (S3) or serve via your app.
-            # For simplicity, here we'll save to /tmp and serve from /tts_static if you added that route.
-            audio_bytes = r.content
-            filename = f"/tmp/tts_{call_sid}.mp3"
-            with open(filename, "wb") as f:
-                f.write(audio_bytes)
-            # Publicly accessible URL for the file; adapt to your domain + static route
-            tts_url = f"{PUBLIC_BASE_URL}/tts_static/{os.path.basename(filename)}"
-        else:
-            logger.error("ElevenLabs TTS failed %s %s", r.status_code, r.text)
-
-        if tts_url:
-            twiml = f"<Response><Play>{tts_url}</Play></Response>"
-            twilio_client.calls(call_sid).update(twiml=twiml)
-            logger.info("Queued TTS reply for %s", call_sid)
-    except Exception:
-        logger.exception("reply_via_tts_and_play failed for %s", call_sid)
-
-
-# --- Logging ----------------------------------------------------------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s pid=%(process)d tid=%(thread)d %(name)s %(message)s")
-logger = logging.getLogger("ws_server_full")
-logger.setLevel(logging.DEBUG)
-console = logging.StreamHandler()
-console.setLevel(logging.DEBUG)
-formatter = logging.Formatter("%(asctime)s %(levelname)s pid=%(process)d tid=%(thread)d %(name)s %(message)s")
-console.setFormatter(formatter)
-if not logger.handlers:
-    logger.addHandler(console)
-
-# --- FastAPI app ------------------------------------------------------------
-app = FastAPI(title="Twilio Media + TTS Server (full-logging)")
-
-# Mount static dir and ensure markers exist
-TTS_DIR.mkdir(parents=True, exist_ok=True)
-MARKER_DIR.mkdir(parents=True, exist_ok=True)
-app.mount("/tts_static", StaticFiles(directory=str(TTS_DIR)), name="tts_static")
-
-
-# --- Helpers ---------------------------------------------------------
-
-import asyncio
+# Twilio
+from twilio.rest import Client
 from twilio.base.exceptions import TwilioRestException
 
-import threading
+# Websockets / HTTP server bits (you may be using a different framework)
+import websockets
+from aiohttp import web
 
-def queue_playback(call_sid: str, audio_url_or_twiml: str):
-    # this runs the blocking Twilio client call in a separate thread
-    def _update():
-        # if you want a Play URL:
-        twiml = f'<Response><Play>{audio_url_or_twiml}</Play></Response>'
-        # or if you want Say:
-        # twiml = f'<Response><Say>{audio_url_or_twiml}</Say></Response>'
-        twilio_client.calls(call_sid).update(twiml=twiml)
+# --- Configuration / env-driven values (PATCHED) ---
+LOG_LEVEL = logging.DEBUG if os.getenv("DEBUG", "false").lower() in ("1", "true", "yes") else logging.INFO
+logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+log = logging.getLogger("ws_server_patch")
 
-    threading.Thread(target=_update, daemon=True).start()
+TWILIO_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH = os.getenv("TWILIO_AUTH_TOKEN")
 
+# Public host that Twilio and remote services will contact — prefer full URL or host-only
+# Examples:
+#   NGROK_HOST=1bc9f559ec09.ngrok-free.app    -> we will build wss://1bc9f559ec09.ngrok-free.app/twilio-media
+#   PUBLIC_HOST=https://1bc9f559ec09.ngrok-free.app  -> used as-is
+NGROK_HOST = os.getenv("NGROK_HOST")         # host without scheme
+PUBLIC_HOST = os.getenv("PUBLIC_HOST")       # or full URL with scheme (https://...)
+STREAM_PATH = os.getenv("STREAM_PATH", "twilio-media")  # path portion for stream endpoint
 
-# Make sure `twilio_client` is your Twilio REST client instance already created
-# e.g. from twilio.rest import Client
-# twilio_client = Client(ACCOUNT_SID, AUTH_TOKEN)
-
-async def play_welcome_async(call_sid: str, audio_url: str = None, text: str | None = None):
-    """
-    Play a welcome audio or TTS into an existing live Twilio call.
-
-    - If `audio_url` is provided we send <Play>{audio_url}</Play>.
-    - Else if `text` provided we send <Say>{text}</Say>.
-    - This uses asyncio.to_thread to avoid blocking the event loop.
-    """
-    if not call_sid:
-        return
-
-    if audio_url:
-        twiml = f"<Response><Play>{audio_url}</Play></Response>"
-    elif text:
-        # Use Say for TTS; you can use voice attribute as needed
-        safe_text = (text.replace("&", "&amp;")
-                         .replace("<", "&lt;")
-                         .replace(">", "&gt;"))
-        twiml = f'<Response><Say voice="Polly.Joanna">{safe_text}</Say></Response>'
-    else:
-        return
-
+# folder for debug markers (same as your original code used tmp paths)
+TMP = Path(os.getenv("TMP", "/tmp"))
+if not TMP.exists():
     try:
-        # Run the synchronous Twilio REST call off the event loop
-        await asyncio.to_thread(twilio_client.calls(call_sid).update, twiml=twiml)
-    except TwilioRestException as e:
-        logger.exception("Twilio REST error while queuing welcome for %s: %s", call_sid, e)
+        TMP.mkdir(parents=True, exist_ok=True)
     except Exception:
-        logger.exception("Failed to queue welcome playback for %s", call_sid)
+        TMP = Path(".")  # fallback to current directory
 
-def now_iso():
-    return datetime.utcnow().isoformat() + "Z"
+# --- Validate credentials early (PATCHED) ---
+if not TWILIO_SID or not TWILIO_AUTH:
+    log.error(
+        "Twilio credentials not found. Set TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN environment variables.\n"
+        "Example (PowerShell): $env:TWILIO_ACCOUNT_SID='ACxxx'; $env:TWILIO_AUTH_TOKEN='your_auth_token'"
+    )
+    # Instead of exiting abruptly (in case you want the server to start for debugging), we raise an exception:
+    raise SystemExit("Missing Twilio credentials (TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN)")
 
-def monotonic_ms():
-    return int(time.monotonic() * 1000)
+twilio_client = Client(TWILIO_SID, TWILIO_AUTH)
 
-def mask_secret(s):
-    if not s:
-        return None
-    s = str(s)
-    if len(s) <= 8:
-        return "****"
-    return s[:4] + "..." + s[-4:]
-
-def task_name_or_none():
-    try:
-        return asyncio.current_task().get_name()
-    except Exception:
-        return None
-
-def write_marker(prefix: str, name: str, payload: dict):
-    """Write a small JSON marker file to MARKER_DIR with given prefix and name."""
-    try:
-        fname = f"{prefix}_{name}.json"
-        path = MARKER_DIR / fname
-        with open(path, "w") as f:
-            json.dump(payload, f)
-            f.flush()
-            try:
-                os.fsync(f.fileno())
-            except Exception:
-                logger.exception("write_marker: fsync failed for %s", path)
-        logger.info("WROTE marker %s", path)
-        return str(path)
-    except Exception as ex:
-        logger.exception("write_marker: failed to write marker %s_%s: %s", prefix, name, ex)
-        return None
-
-# --- NEW: safe websocket close helper (single change: replace await ws.close() calls with this) ---
-async def safe_close_ws(ws: WebSocket):
-    """Attempt to close the websocket but ignore the RuntimeError raised if ASGI already closed it."""
-    try:
-        await ws.close()
-    except RuntimeError as e:
-        # This is expected in races where the ASGI layer already sent websocket.close
-        logger.debug("safe_close_ws: ws.close() raised RuntimeError (already closed?): %s", e)
-    except Exception as e:
-        # Log unexpected closing errors with stack
-        logger.exception("safe_close_ws: unexpected exception while closing websocket: %s", e)
-
-# --- Twilio REST helpers --------------------------------------------------
-async def call_get_status(call_sid: str) -> Optional[str]:
-    start = monotonic_ms()
-    logger.debug("call_get_status: entering call_sid=%s at=%s task=%s", call_sid, now_iso(), task_name_or_none())
-    try:
-        logger.info("BEGIN Twilio API Request (fetch call) call_sid=%s start_ms=%d", call_sid, start)
-        call = twilio_client.calls(call_sid).fetch()
-        elapsed = monotonic_ms() - start
-        logger.info("END Twilio API Request (fetch call) call_sid=%s elapsed_ms=%d repr_len=%d", call_sid, elapsed, len(repr(call)))
-        try:
-            status = getattr(call, "status", None)
-            direction = getattr(call, "direction", None)
-            from_ = getattr(call, "from_", getattr(call, "from", None))
-            to = getattr(call, "to", None)
-            logger.debug("call_get_status: attrs: status=%s direction=%s from=%s to=%s", status, direction, from_, to)
-        except Exception:
-            logger.exception("call_get_status: failed to read some call attributes for %s", call_sid)
-        return getattr(call, "status", None)
-    except Exception as ex:
-        logger.exception("Exception fetching call status for %s: %s", call_sid, ex)
-        logger.debug("call_get_status: traceback: %s", traceback.format_exc())
-        return None
-
-async def play_tts_with_wait(call_sid: str, tts_url: str, timeout_s: float = POLL_TIMEOUT_SECONDS, poll_interval: float = POLL_INTERVAL_SECONDS) -> bool:
-    start_time = monotonic_ms()
-    logger.debug("play_tts_with_wait: start call_sid=%s tts_url=%s timeout_s=%s poll_interval=%s at=%s task=%s", call_sid, tts_url, timeout_s, poll_interval, now_iso(), task_name_or_none())
-    deadline = datetime.utcnow() + timedelta(seconds=timeout_s)
-    last_status = None
-    loop_count = 0
-
-    logger.info("play_tts_with_wait: call %s waiting for in-progress until=%s (timeout_s=%.1f)", call_sid, deadline.isoformat(), timeout_s)
-
-    while datetime.utcnow() < deadline:
-        loop_count += 1
-        loop_start = monotonic_ms()
-        try:
-            status = await call_get_status(call_sid)
-        except Exception as ex:
-            logger.exception("play_tts_with_wait: unexpected exception while checking status for %s: %s", call_sid, ex)
-            status = None
-
-        elapsed_loop = monotonic_ms() - loop_start
-        logger.debug("play_tts_with_wait: loop=%d elapsed_ms=%d status=%s", loop_count, elapsed_loop, status)
-
-        if status:
-            last_status = status
-            logger.info("play_tts_with_wait: call=%s loop=%d status=%s deadline_in_ms=%d", call_sid, loop_count, status, int((deadline - datetime.utcnow()).total_seconds() * 1000))
-            if status != "in-progress":
-                logger.debug("play_tts_with_wait: call=%s not yet in-progress (current=%s)", call_sid, status)
-            if status == "in-progress":
-                twiml = f"<Response><Play>{tts_url}</Play></Response>"
-                try:
-                    logger.info("play_tts_with_wait: attempting calls(%s).update(twiml=...) at=%s", call_sid, now_iso())
-                    resp = twilio_client.calls(call_sid).update(twiml=twiml)
-                    logger.info("play_tts_with_wait: update returned repr=%s", repr(resp))
-                    try:
-                        resp_sid = getattr(resp, 'sid', None)
-                        resp_status = getattr(resp, 'status', None)
-                        resp_to = getattr(resp, 'to', None)
-                        resp_from = getattr(resp, 'from_', getattr(resp, 'from', None))
-                        logger.debug("play_tts_with_wait: update response attrs sid=%s status=%s to=%s from=%s", resp_sid, resp_status, resp_to, resp_from)
-                    except Exception:
-                        logger.exception("play_tts_with_wait: failed to read response attributes after update for %s", call_sid)
-                    total_elapsed = monotonic_ms() - start_time
-                    logger.info("play_tts_with_wait: update success for %s total_elapsed_ms=%d loops=%d", call_sid, total_elapsed, loop_count)
-                    return True
-                except Exception as ex:
-                    logger.exception("play_tts_with_wait: failed to update call %s while in-progress: %s", call_sid, ex)
-                    logger.debug("play_tts_with_wait: update exception traceback: %s", traceback.format_exc())
-                    try:
-                        logger.debug("play_tts_with_wait: context pid=%d tid=%d task=%s env_base_url=%s", os.getpid(), threading.get_ident(), task_name_or_none(), mask_secret(BASE_URL))
-                        logger.debug("play_tts_with_wait: masked_twilio_sid=%s masked_token=%s", mask_secret(TWILIO_ACCOUNT_SID), mask_secret(TWILIO_AUTH_TOKEN))
-                    except Exception:
-                        logger.exception("play_tts_with_wait: failed to log extra context")
-                    return False
+# --- Utility: build a valid Stream URL from env --- 
+def build_stream_url():
+    """
+    Build a wss://... stream url based on PUBLIC_HOST or NGROK_HOST.
+    - If PUBLIC_HOST provided and already includes scheme, use it.
+    - If NGROK_HOST provided, assume wss://<NGROK_HOST>/<STREAM_PATH>
+    """
+    if PUBLIC_HOST:
+        host = PUBLIC_HOST.strip()
+        # If PUBLIC_HOST has https://, replace with wss:// for websockets
+        if host.startswith("https://"):
+            ws = "wss://" + host[len("https://"):]
+            # ensure trailing slash removal then append path
+            ws = ws.rstrip("/") + "/" + STREAM_PATH.lstrip("/")
+            return ws
+        elif host.startswith("http://"):
+            ws = "ws://" + host[len("http://"):]
+            ws = ws.rstrip("/") + "/" + STREAM_PATH.lstrip("/")
+            return ws
+        elif host.startswith("wss://") or host.startswith("ws://"):
+            return host.rstrip("/") + "/" + STREAM_PATH.lstrip("/")
         else:
-            logger.warning("play_tts_with_wait: could not read status for call %s on loop %d, will retry (deadline in %.1fs)", call_sid, loop_count, (deadline - datetime.utcnow()).total_seconds())
-        try:
-            sleep_ms = int(poll_interval * 1000)
-            logger.debug("play_tts_with_wait: sleeping for %d ms (loop=%d)", sleep_ms, loop_count)
-            await asyncio.sleep(poll_interval)
-        except Exception:
-            logger.exception("play_tts_with_wait: sleep interrupted")
-    logger.warning("play_tts_with_wait: timed out waiting for in-progress call=%s last_status=%s loops=%d", call_sid, last_status, loop_count)
-    twiml = f"<Response><Play>{tts_url}</Play></Response>"
+            # treat as host-only
+            return "wss://" + host.rstrip("/") + "/" + STREAM_PATH.lstrip("/")
+    elif NGROK_HOST:
+        # host-only
+        return "wss://" + NGROK_HOST.rstrip("/") + "/" + STREAM_PATH.lstrip("/")
+    else:
+        # fallback to localhost (useful for local testing with reverse proxy)
+        log.warning("No PUBLIC_HOST or NGROK_HOST configured; defaulting to localhost (wss://127.0.0.1)")
+        return "wss://127.0.0.1:10000/" + STREAM_PATH.lstrip("/")
+
+# Example usage: stream_url = build_stream_url()
+
+# --- Twilio call-update wrapper with clear logging + exception handling (PATCHED) ---
+async def update_call_twiml_async(call_sid: str, twiml: str):
+    """
+    Update the Twilio Call resource twiml safely from asyncio (runs in thread pool).
+    Logs clear errors for authentication issues (401).
+    """
+    log.debug("Preparing to update call %s with new twiml", call_sid)
+    loop = asyncio.get_running_loop()
     try:
-        logger.info("play_tts_with_wait: falling back to final calls(%s).update(twiml=...) attempt at=%s", call_sid, now_iso())
-        resp = twilio_client.calls(call_sid).update(twiml=twiml)
-        logger.info("play_tts_with_wait: final update response repr=%s", repr(resp))
-        return True
-    except Exception as ex:
-        logger.exception("play_tts_with_wait: final REST update failed for call %s: %s", call_sid, ex)
-        logger.debug("play_tts_with_wait: final update exception traceback: %s", traceback.format_exc())
-        return False
+        # run blocking twilio client in thread
+        resp = await loop.run_in_executor(None, lambda: twilio_client.calls(call_sid).update(twiml=twiml))
+        log.info("Call %s updated (sid=%s)", call_sid, getattr(resp, "sid", "<no-sid>"))
+        return resp
+    except TwilioRestException as e:
+        # Twilio error codes are helpful; 20003 indicates auth failure
+        log.error("TwilioRestException updating call %s: status=%s, code=%s, msg=%s", call_sid, e.status, getattr(e, "code", None), e.msg)
+        if getattr(e, "code", None) == 20003 or e.status == 401:
+            log.error("Authentication failed with Twilio: check TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN. (Received 401 / code 20003)")
+        # re-raise so the caller can decide (or swallow depending on desired behavior)
+        raise
 
-def tts_file_url_for(call_sid: str) -> (str, str):
-    ts = int(datetime.utcnow().timestamp() * 1000)
-    fname = f"tts_{call_sid}_{ts}.wav"
-    url = f"{BASE_URL}/tts/{fname}"
-    logger.debug("tts_file_url_for: call_sid=%s -> url=%s fname=%s", call_sid, url, fname)
-    return url, fname
-
-# --- Routes -----------------------------------------------------------------
-@app.post("/twiml_stream")
-async def twiml_stream(request: Request):
-    logger.debug("twiml_stream: received request headers=%s", dict(request.headers))
-    form = await request.form()
-    call_sid = form.get("CallSid") or form.get("callSid") or form.get("callsid")
-    logger.info("Received Twilio webhook /twiml_stream callSid=%s From=%s To=%s form_keys=%s pid=%d", call_sid, form.get("From"), form.get("To"), list(form.keys()), os.getpid())
+# --- Marker writer helper (similar to your original code) ---
+def write_marker(name: str, data: dict):
+    ts = datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
+    filename = TMP / f"ws_{name}_{ts}.json"
     try:
-        safe_form = {}
-        for k, v in form.items():
-            sk = k
-            sv = v
-            if 'token' in k.lower() or 'auth' in k.lower() or 'secret' in k.lower():
-                sv = 'REDACTED'
-            safe_form[sk] = sv
-        logger.debug("twiml_stream: form (redacted)=%s", json.dumps(safe_form))
-    except Exception:
-        logger.exception("twiml_stream: failed to log form data for call %s", call_sid)
-    host = request.headers.get('host') or ''
-    stream_url = f"wss://{host}/twilio-media"
-    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Start>
-    <Stream url="wss://1bc9f559ec09.ngrok-free.app/twilio-media" />
-  </Start>
-  <!-- short pause to give the websocket a moment to connect -->
-  <Pause length="1"/>
-  <Say voice="Polly.Joanna">Connecting you to your AI assistant...</Say>
-</Response>
-"""
-    logger.info("twiml_stream: Returning TwiML Start/Stream -> %s for call %s twiml_len=%d", stream_url, call_sid, len(twiml))
-    return Response(content=twiml, media_type="application/xml")
+        with open(filename, "w", encoding="utf-8") as f:
+            json.dump(data, f, default=str, indent=2)
+        log.info("WROTE marker %s", str(filename))
+    except Exception as exc:
+        log.exception("Failed to write marker %s: %s", filename, exc)
 
-@app.post("/twiml_fallback_play")
-async def twiml_fallback_play(request: Request):
-    """Simple TwiML <Play> fallback to test audio delivery to Twilio without websockets"""
-    form = await request.form()
-    call_sid = form.get("CallSid")
-    logger.info("twiml_fallback_play: received test play request callSid=%s From=%s To=%s", call_sid, form.get("From"), form.get("To"))
-    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Play>{TEST_AUDIO_URL}</Play>
-</Response>"""
-    return Response(content=twiml, media_type="application/xml")
-
-@app.get("/health")
-async def health():
-    return PlainTextResponse("ok")
-
-@app.websocket("/twilio-media")
-async def twilio_media_ws(ws: WebSocket):
-    await ws.accept()
-    # --- LOG ASGI SCOPE + WRITE HANDSHAKE SCOPE MARKER --------------------------------
+# --- Example handler that Twilio Media Streams will call over websocket ---
+# (Your original code likely has a more complete websocket handling loop; this is a conservative minimal example.)
+async def twilio_media_ws(websocket, path):
+    """
+    Handle Twilio Media Streams WebSocket connection.
+    Expect the remote Twilio client to start sending JSON media events with base64 payloads.
+    """
+    log.info("New websocket connection path=%s", path)
+    call_sid = None
     try:
-        scope = getattr(ws, "scope", {}) or {}
-        headers = {}
-        for h in scope.get("headers", []):
+        async for raw in websocket:
+            # Twilio sends JSON text messages with { "event":"media", "media": {...} } etc.
             try:
-                k = h[0].decode() if isinstance(h[0], (bytes, bytearray)) else str(h[0])
-                v = h[1].decode() if isinstance(h[1], (bytes, bytearray)) else str(h[1])
+                msg = json.loads(raw)
             except Exception:
-                k = str(h[0]); v = str(h[1])
-            kl = k.lower()
-            if "authorization" in kl or "cookie" in kl or "token" in kl or "auth" in kl or "x-twilio-signature" in kl:
-                v = "***REDACTED***"
-            headers[k] = v
-        client_info = scope.get("client")
-        path_info = scope.get("path")
-        logger.info("WS ASGI scope client=%s path=%s headers_sample=%s", client_info, path_info, dict(list(headers.items())[:20]))
-        try:
-            ts_accept = int(time.time() * 1000)
-            marker = {
-                "timestamp": now_iso(),
-                "client": client_info,
-                "path": path_info,
-                "headers": headers,
-                "pid": os.getpid(),
-                "tid": threading.get_ident()
-            }
-            marker_path = f"/tmp/ws_accept_{ts_accept}_scope.json"
-            with open(marker_path, "w") as mf:
-                json.dump(marker, mf)
-                mf.flush()
-                try:
-                    os.fsync(mf.fileno())
-                except Exception:
-                    logger.exception("failed fsync marker %s", marker_path)
-            logger.info("WROTE WS accept scope marker %s", marker_path)
-            write_marker("ws_handshake", str(ts_accept), marker)
-        except Exception:
-            logger.exception("failed to write ws accept scope marker")
-    except Exception:
-        logger.exception("Failed to log websocket scope on accept")
-    # ------------------------------------------------------------------------------------
-
-    client = None
-    try:
-        client = getattr(ws, "client", None)
-    except Exception:
-        pass
-    logger.info("WebSocket accepted client=%s remote=%s pid=%d tid=%d", getattr(client, 'host', None), getattr(client, 'port', None), os.getpid(), threading.get_ident())
-
-    msg_count = 0
-    try:
-        while True:
-            msg = await ws.receive_text()
-            msg_count += 1
-            logger.debug("WS received raw length=%d first200=%s", len(msg), msg[:200])
-            try:
-                obj = json.loads(msg)
-            except Exception:
-                logger.exception("Failed to json.loads websocket message on msg_count=%d", msg_count)
+                log.debug("Received non-json websocket frame; ignoring")
                 continue
 
-            event = obj.get("event")
-            if event == "start":
-                start_payload = obj.get("start", {})
-                # Attempt to extract callSid from different possible keys
-                call_sid = start_payload.get("callSid") or start_payload.get("call_sid") or start_payload.get("CallSid") or start_payload.get("callSid")
-                ts2 = int(time.time() * 1000)
-                if call_sid:
-                    marker_payload = {
-                        "timestamp": now_iso(),
-                        "callSid": call_sid,
-                        "start_payload": start_payload,
-                        "msg_count": msg_count
-                    }
-                    write_marker("ws_connected", call_sid, marker_payload)
-                    #asyncio.create_task(play_welcome_async(call_sid, text="Welcome to the AI assistant. Please say something."))
-                    # schedule it (don't await)
-                    asyncio.create_task(queue_playback_async(call_sid, "Hello — connecting you now"))
+            # write a marker so debug/markers endpoints can show it
+            write_marker("media_sample", msg)
 
-                     # simple: reply with pre-defined text
-                    try:
-                        user_text = "Hello there! This is your AI voice assistant speaking from OpenAI and ElevenLabs."
-                        reply_via_tts_and_play(call_sid, user_text)
-                    except Exception:
-                        logger.exception("Failed to initiate TTS reply for %s", call_sid)   
-                    # --- play a short welcome message right after call starts ---
-                    try:
-                        # use TEST_AUDIO_URL env var. If not set, change the default at module top.
-                        twiml = f"<Response><Play>{TEST_AUDIO_URL}</Play></Response>"
-                        # This is synchronous and simple — Twilio REST call to push TwiML to live call
-                        twilio_client.calls(call_sid).update(twiml=twiml)
-                        logger.info("Queued welcome message for %s", call_sid)
-                    except Exception:
-                        logger.exception("Failed to queue welcome playback for %s", call_sid)
-                    # --- end welcome block ---
+            # Example: if Twilio sent 'start' event containing callSid
+            if msg.get("event") == "start":
+                call_sid = msg.get("start", {}).get("callSid") or msg.get("start", {}).get("call_sid")
+                write_marker("ws_start", {"timestamp": datetime.utcnow().isoformat(), "callSid": call_sid})
+                log.info("Start event for call %s", call_sid)
 
-                    logger.info("INBOUND stream started msg_count=%d callSid=%s -> wrote marker ws_connected_%s.json", msg_count, call_sid, call_sid)
-                
+            # For actual inbound audio events, decode and process:
+            if msg.get("event") == "media" and "media" in msg:
+                media = msg["media"]
+                track = media.get("track")
+                payload_b64 = media.get("payload")
+                if payload_b64:
                     try:
-                        twiml = f"<Response><Play>{TEST_AUDIO_URL}</Play></Response>"
-                        twilio_client.calls(call_sid).update(twiml=twiml)
-                        logger.info("Queued welcome message for %s", call_sid)
-                    except Exception:
-                        logger.exception("Failed to queue welcome playback for %s", call_sid)
-                # --- end of welcome message block ---
+                        audio_bytes = base64.b64decode(payload_b64)
+                        # TODO: feed audio_bytes to your speech pipeline / file
+                        # For debug, write small sample marker
+                        write_marker("media_chunk", {"len": len(audio_bytes), "track": track})
+                    except Exception as exc:
+                        log.exception("Failed to decode media payload: %s", exc)
                 else:
-                    marker_name = f"{ts2}"
-                    write_marker("ws_start", marker_name, {"timestamp": now_iso(), "start_payload": start_payload, "msg_count": msg_count})
-                    logger.info("INBOUND stream started msg_count=%d (no callSid found) -> wrote marker ws_start_%s.json", msg_count, marker_name)
-            elif event == "media":
-                payload = obj.get("media", {}).get("payload")
-                if payload:
-                    payload_len = len(payload)
-                    approx_bytes = int(payload_len * 3 / 4)
-                    logger.info("INBOUND media event msg_count=%d payload_len=%d approx_bytes=%d", msg_count, payload_len, approx_bytes)
-                    # For deeper debugging, optionally write a small sample marker
-                    if msg_count % 50 == 0:
-                        try:
-                            sample_marker = {"timestamp": now_iso(), "msg_count": msg_count, "sample_start": payload[:64], "sample_end": payload[-64:]}
-                            write_marker("ws_media_sample", str(int(time.time()*1000)), sample_marker)
-                        except Exception:
-                            logger.exception("failed to write media sample marker")
-                else:
-                    logger.warning("INBOUND media event without payload on msg_count=%d", msg_count)
-            elif event == "stop":
-                logger.info("Stream stop event received msg_count=%d: %s", msg_count, json.dumps(obj.get('stop', {})))
-            else:
-                logger.debug("Unhandled Twilio media event msg_count=%d event=%s obj_keys=%d", msg_count, event, len(obj))
-    except Exception as ex:
-        logger.info("WS closed unexpectedly: %s", ex)
-        logger.debug("twilio_media_ws: traceback: %s", traceback.format_exc())
+                    log.debug("media event without payload")
+    except websockets.exceptions.ConnectionClosed as e:
+        log.info("Websocket closed: %s", e)
+    except Exception:
+        log.exception("Unhandled exception in websocket handler")
     finally:
-        # REPLACED direct await ws.close() with safe_close_ws(ws)
+        log.info("Websocket handler finished for call_sid=%s", call_sid)
+
+# --- Example aiohttp debug endpoint to list markers (mimics your /debug/markers) ---
+async def debug_markers(request):
+    """
+    Return a JSON array of marker files in TMP.
+    (This mirrors behaviour you used via Invoke-RestMethod against http://127.0.0.1:10000/debug/markers)
+    """
+    entries = []
+    for p in sorted(TMP.glob("ws_*.json"))[-200:]:
+        stat = p.stat()
         try:
-            await safe_close_ws(ws)
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
         except Exception:
-            logger.exception("Error in safe_close_ws")
-        logger.info("WS closed (handler exit) total_msgs=%d", msg_count)
+            data = "<unreadable>"
+        entries.append({"name": p.name, "size": stat.st_size, "mtime": datetime.utcfromtimestamp(stat.st_mtime).isoformat() + "Z", "data": data})
+    return web.json_response({"count": len(entries), "markers": entries})
 
-
-@app.get("/tts/{fname}")
-async def serve_tts(fname: str):
-    safe_name = Path(fname).name
-    file_path = TTS_DIR / safe_name
-    logger.debug("serve_tts: requested fname=%s resolved_path=%s pid=%d", fname, file_path, os.getpid())
-    if not file_path.exists():
-        logger.warning("serve_tts: requested file not found: %s", file_path)
-        raise HTTPException(status_code=404, detail="tts file not found")
+# --- Example function to queue a welcome playback (calls Twilio update to change Twiml) ---
+async def queue_welcome_playback(call_sid: str, text_to_say: str = "Connecting you to your AI assistant..."):
+    """
+    Build minimal TwiML with <Say> and <Start><Stream> and update the Twilio call.
+    This is what in your logs was failing with a 401.
+    """
+    stream_url = build_stream_url()
+    # Build TwiML; adapt to your original format and voice selection
+    twiml = (
+        f"<Response>\n"
+        f"  <Say voice=\"Polly.Joanna\">{text_to_say}</Say>\n"
+        f"  <Start>\n"
+        f"    <Stream url=\"{stream_url}\" />\n"
+        f"  </Start>\n"
+        f"</Response>"
+    )
+    log.debug("Built twiml: %s", twiml)
     try:
-        size = file_path.stat().st_size
-    except Exception:
-        size = None
-    logger.info("Serving TTS file %s size_bytes=%s (exists=%s)", file_path, size, file_path.exists())
-    try:
-        st = file_path.stat()
-        logger.debug("serve_tts: file mode=%o uid=%s gid=%s mtime=%s", st.st_mode, getattr(st, 'st_uid', None), getattr(st, 'st_gid', None), datetime.utcfromtimestamp(st.st_mtime).isoformat())
-    except Exception:
-        logger.exception("serve_tts: unable to stat file for %s", file_path)
-    return FileResponse(path=str(file_path), media_type="audio/wav", filename=safe_name)
+        resp = await update_call_twiml_async(call_sid, twiml)
+        return resp
+    except TwilioRestException:
+        # already logged in update_call_twiml_async; return None for caller handling
+        return None
 
+# --- Application startup code (simple aiohttp server)
+def create_app():
+    app = web.Application()
+    app.add_routes([web.get("/debug/markers", debug_markers)])
+    return app
 
-# --- Example orchestration for playing TTS into a call ----------------------
-async def handle_playback_for_call(call_sid: str, tts_bytes: bytes) -> bool:
-    logger.debug("handle_playback_for_call: start call_sid=%s bytes=%d pid=%d task=%s", call_sid, len(tts_bytes), os.getpid(), task_name_or_none())
-    url, fname = tts_file_url_for(call_sid)
-    file_path = TTS_DIR / fname
-    logger.info("handle_playback_for_call: will write tts file %s (bytes=%d)", file_path, len(tts_bytes))
-
-    try:
-        with open(file_path, "wb") as f:
-            f.write(tts_bytes)
-            f.flush()
-            try:
-                os.fsync(f.fileno())
-                logger.debug("handle_playback_for_call: fsync succeeded for %s", file_path)
-            except Exception:
-                logger.exception("handle_playback_for_call: fsync failed for %s", file_path)
-        final_size = file_path.stat().st_size
-        logger.info("handle_playback_for_call: file written ok path=%s size=%d", file_path, final_size)
-    except Exception as ex:
-        logger.exception("handle_playback_for_call: failed to write tts file %s: %s", file_path, ex)
-        logger.debug("handle_playback_for_call: traceback: %s", traceback.format_exc())
-        return False
-
-    try:
-        logger.info("handle_playback_for_call: about to play tts for call=%s url=%s", call_sid, url)
-    except Exception:
-        logger.exception("handle_playback_for_call: failed composing about-to-play log")
-
-    ok = await play_tts_with_wait(call_sid, url, timeout_s=POLL_TIMEOUT_SECONDS, poll_interval=POLL_INTERVAL_SECONDS)
-    if ok:
-        logger.info("handle_playback_for_call: playback triggered for call %s", call_sid)
-    else:
-        logger.warning("handle_playback_for_call: playback could not be triggered for call %s", call_sid)
-    return ok
-
-@app.get("/debug/markers")
-async def list_markers():
-    """Return list of recent marker files and contents (for debugging via Postman)."""
-    import glob, json, os, pathlib, time
-    files = sorted(glob.glob("/tmp/ws_*.json"), key=os.path.getmtime, reverse=True)
-    latest = []
-    for f in files[:10]:  # limit to 10 newest
-        try:
-            stat = os.stat(f)
-            with open(f) as fp:
-                data = json.load(fp)
-            latest.append({
-                "name": pathlib.Path(f).name,
-                "size": stat.st_size,
-                "mtime": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(stat.st_mtime)),
-                "data": data
-            })
-        except Exception as e:
-            latest.append({"name": f, "error": str(e)})
-    return {"count": len(latest), "markers": latest}
-
-
-# If run directly, start uvicorn for local dev.
+# If you want to run a simple aiohttp server for the debug endpoint:
 if __name__ == "__main__":
-    import uvicorn
-    logger.info("Starting ws_server uvicorn app on port %s pid=%d", os.getenv("PORT", "10000"), os.getpid())
-    uvicorn.run("ws_server:app", host="0.0.0.0", port=int(os.getenv("PORT", "10000")), log_level="info")
-
-
-
-
+    # Run aiohttp debug server on port 10000 (to match original debug endpoint)
+    app = create_app()
+    port = int(os.getenv("PORT", "10000"))
+    host = os.getenv("HOST", "127.0.0.1")
+    log.info("Starting debug http server on %s:%s (markers path: %s)", host, port, "/debug/markers")
+    web.run_app(app, host=host, port=port)
