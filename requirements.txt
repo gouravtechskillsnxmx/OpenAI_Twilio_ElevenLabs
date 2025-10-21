@@ -1,11 +1,16 @@
+sqlalchemy
+psycopg2-binary
+redis
 fastapi
 uvicorn[standard]
-python-dotenv
 requests
-websockets
-openai
-pyttsx3
-pydub
 twilio
+openai>=1.0.0
+boto3
+pydantic
+sqlalchemy
+psycopg2-binary
+redis
+python-dotenv
 python-multipart
 
