@@ -30,8 +30,8 @@ from memory import write_fact  # function to write facts to Postgres + audit
 from memory_api import router as memory_router
 
 # ---------------- CONFIG / ENV ----------------
-TWILIO_SID = os.environ.get("TWILIO_SID")
-TWILIO_TOKEN = os.environ.get("TWILIO_TOKEN")
+TWILIO_SID = os.environ.get("TWILIO_ACCOUNT_SID")
+TWILIO_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
 TWILIO_FROM = os.environ.get("TWILIO_FROM")  # optional for calling out
 OPENAI_KEY = os.environ.get("OPENAI_KEY")
 AGENT_ENDPOINT = os.environ.get("AGENT_ENDPOINT")  # your established ChatGPT agent endpoint (optional)
@@ -383,3 +383,4 @@ async def call_outbound(request: Request):
     except Exception as e:
         logger.exception("Failed to create outbound call to %s: %s", to_number, e)
         return JSONResponse({"error": "call failed"}, status_code=500)
+
