@@ -32,7 +32,7 @@ from memory_api import router as memory_router
 # ---------------- CONFIG / ENV ----------------
 TWILIO_SID = os.environ.get("TWILIO_ACCOUNT_SID")
 TWILIO_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
-TWILIO_FROM = os.environ.get("TWILIO_FROM")  # optional for calling out
+TWILIO_FROM = os.environ.get("TWILIO_FROM","+15312303465")  # optional for calling out
 OPENAI_KEY = os.environ.get("OPENAI_KEY")
 AGENT_ENDPOINT = os.environ.get("AGENT_ENDPOINT")  # your established ChatGPT agent endpoint (optional)
 AGENT_KEY = os.environ.get("AGENT_KEY")
@@ -253,43 +253,46 @@ async def recording(request: Request, background_tasks: BackgroundTasks):
     return Response(status_code=204)
 
 # ---------------- background pipeline ----------------
-async def process_recording_background(call_sid: str, recording_url: str, from_number: Optional[str]=None):
+import os, tempfile, requests, logging
+from requests.auth import HTTPBasicAuth
+from typing import Optional
+
+
+async def process_recording_background(call_sid: str, recording_url: str, from_number: Optional[str] = None):
     """
-    1) Download recording (with Twilio basic auth if it's a Twilio URL)
-    2) Save to temp file
-    3) Transcribe via OpenAI
-    4) Call agent (AGENT_ENDPOINT or OpenAI fallback)
-    5) If agent returns 'memory_writes' -> write facts via memory.write_fact(...)
-    6) Generate TTS via ElevenLabs, upload to S3, generate presigned URL
-    7) Update Twilio call with <Play>presigned_url</Play> + <Record> to continue
+    Background pipeline:
+    1) Download recording (with Twilio basic auth if Twilio URL)
+    2) Transcribe via OpenAI
+    3) Call agent (or fallback)
+    4) Handle memory writes
+    5) Generate TTS, upload to S3
+    6) Safely update Twilio call or fallback to outbound call
     """
     logger.info("[%s] background start - download_url=%s", call_sid, recording_url)
+
     try:
         download_url = build_download_url(recording_url)
+        auth = HTTPBasicAuth(TWILIO_SID, TWILIO_TOKEN) if (
+											  
+            TWILIO_SID and TWILIO_TOKEN and "api.twilio.com" in download_url
+        ) else None
 
-        # Authenticate if Twilio API recording
-        auth = HTTPBasicAuth(TWILIO_SID, TWILIO_TOKEN) if (TWILIO_SID and TWILIO_TOKEN and "api.twilio.com" in download_url) else None
-
-        # Try to download
+        # 1️⃣ Download recording
         try:
             r = requests.get(download_url, auth=auth, timeout=30)
             r.raise_for_status()
         except requests.exceptions.HTTPError as he:
-            status = getattr(he.response, "status_code", None) if hasattr(he, "response") else None
-            logger.error("[%s] Download HTTP error status=%s body=%s", call_sid, status, getattr(he.response, "text", str(he))[:400])
-            # fallback TwiML
+            status = getattr(he.response, "status_code", None)
+            logger.error("[%s] Download HTTP error %s: %s", call_sid, status, getattr(he.response, "text", str(he))[:400])
+							
             fallback_twiml = "<Response><Say>Sorry, we couldn't get your audio right now. Please try again later.</Say></Response>"
-            try:
-                if twilio_client:
-                    twilio_client.calls(call_sid).update(twiml=fallback_twiml)
-            except Exception:
-                logger.exception("[%s] Failed sending fallback twiml", call_sid)
+            _safe_update_or_call(call_sid, from_number, fallback_twiml)
             return
         except Exception as e:
             logger.exception("[%s] Download failed: %s", call_sid, e)
             return
 
-        # Save audio to temp file
+        # 2️⃣ Save temp file
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
         tmp.write(r.content)
         tmp.flush()
@@ -297,7 +300,7 @@ async def process_recording_background(call_sid: str, recording_url: str, from_n
         file_path = tmp.name
         logger.info("[%s] saved recording to %s", call_sid, file_path)
 
-        # Transcribe
+        # 3️⃣ Transcribe
         try:
             transcript = transcribe_with_openai(file_path)
             logger.info("[%s] transcript: %s", call_sid, transcript)
@@ -305,10 +308,10 @@ async def process_recording_background(call_sid: str, recording_url: str, from_n
             logger.exception("[%s] STT/transcription failed: %s", call_sid, e)
             transcript = ""
 
-        # Agent call - expects structured dict
+        # 4️⃣ Agent call
         try:
             agent_out = call_agent_and_get_reply(call_sid, transcript)
-            # ensure structure
+							  
             reply_text = (agent_out.get("reply_text") if isinstance(agent_out, dict) else str(agent_out)) or ""
             memory_writes = agent_out.get("memory_writes") if isinstance(agent_out, dict) else []
         except Exception as e:
@@ -316,9 +319,9 @@ async def process_recording_background(call_sid: str, recording_url: str, from_n
             reply_text = "Sorry, I'm having trouble right now."
             memory_writes = []
 
-        logger.info("[%s] assistant reply (truncated): %s", call_sid, (reply_text[:300] + "...") if len(reply_text) > 300 else reply_text)
+        logger.info("[%s] assistant reply: %s", call_sid, reply_text[:300] + ("..." if len(reply_text) > 300 else ""))
 
-        # If agent returned memory writes, persist them
+        # 5️⃣ Write memory facts if any
         if memory_writes and isinstance(memory_writes, list):
             for mw in memory_writes:
                 try:
@@ -328,24 +331,31 @@ async def process_recording_background(call_sid: str, recording_url: str, from_n
                     written = write_fact(content, created_by=created_by, fact_key=fact_key)
                     logger.info("[%s] wrote memory fact id=%s key=%s", call_sid, written.get("id"), fact_key)
                 except Exception:
-                    logger.exception("[%s] failed to write memory write: %s", call_sid, mw)
+                    logger.exception("[%s] failed to write memory: %s", call_sid, mw)
 
-        # TTS via ElevenLabs and S3 upload
+        # 6️⃣ TTS & upload
         try:
             tts_url = create_and_upload_tts(reply_text)
             logger.info("[%s] tts_url: %s", call_sid, tts_url)
         except Exception as e:
             logger.exception("[%s] TTS/upload failed: %s", call_sid, e)
-            # fallback to Twilio Say
+									
             twiml = f"<Response><Say>{reply_text}</Say><Record maxLength='6' action='https://{HOSTNAME}/recording' playBeep='true' timeout='2'/></Response>"
-            try:
-                if twilio_client:
-                    twilio_client.calls(call_sid).update(twiml=twiml)
-            except Exception:
-                logger.exception("[%s] Failed to send fallback TwiML", call_sid)
+				
+								 
+																
+												
+									  
+																	 
+					 
+																 
+																																   
+            _safe_update_or_call(call_sid, from_number, twiml)
+							 
+																				
             return
 
-        # Build TwiML: Play the presigned URL then Record again
+        # 7️⃣ Build TwiML: Play + Record again
         record_action = f"https://{HOSTNAME}/recording" if HOSTNAME else "/recording"
         twiml = f"""<Response>
             <Play>{tts_url}</Play>
@@ -353,14 +363,35 @@ async def process_recording_background(call_sid: str, recording_url: str, from_n
         </Response>"""
 
         logger.info("[%s] updating Twilio call with Play+Record", call_sid)
-        try:
-            if twilio_client:
-                twilio_client.calls(call_sid).update(twiml=twiml)
-        except Exception:
-            logger.exception("[%s] Failed to update Twilio call", call_sid)
-
+        _safe_update_or_call(call_sid, from_number, twiml)
+							 
     except Exception as e:
         logger.exception("[%s] Unexpected pipeline error: %s", call_sid, e)
+
+
+def _safe_update_or_call(call_sid: str, from_number: Optional[str], twiml: str):
+    """
+    Safely update an in-progress Twilio call or, if ended, create a new outbound call.
+    Prevents Twilio 400/21220 errors ("Call is not in-progress. Cannot redirect.")
+    """
+    try:
+        call = twilio_client.calls(call_sid).fetch()
+        logger.info("[%s] fetched call status=%s", call_sid, call.status)
+
+        if call.status in ("in-progress", "ringing", "queued"):
+            twilio_client.calls(call_sid).update(twiml=twiml)
+            logger.info("[%s] Successfully updated live call.", call_sid)
+        else:
+            logger.warning("[%s] Call is %s; cannot redirect. Making new call if from_number exists.", call_sid, call.status)
+            if from_number and TWILIO_FROM:
+                new_call = twilio_client.calls.create(
+                    to=from_number,
+                    from_=TWILIO_FROM,
+                    twiml=twiml,
+                )
+                logger.info("[%s] Created fallback outbound call %s", call_sid, new_call.sid)
+    except Exception as e:
+        logger.exception("[%s] safe_update_or_call failed: %s", call_sid, e)
 
 # ---------------- optional outbound call endpoint ----------------
 @app.post("/call_outbound")
