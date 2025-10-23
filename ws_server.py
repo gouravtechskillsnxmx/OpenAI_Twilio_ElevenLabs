@@ -373,21 +373,20 @@ async def process_recording_background(call_sid: str, recording_url: str, from_n
     except Exception as e:
         logger.exception("[%s] Unexpected pipeline error: %s", call_sid, e)
 
-
 def _safe_update_or_call(call_sid: str, from_number: Optional[str], twiml: str):
     """
     Safely update an in-progress Twilio call or, if ended, create a new outbound call.
-    Prevents Twilio 400/21220 errors ("Call is not in-progress. Cannot redirect.")
-    This version also validates any <Play> URL is reachable before attempting to redirect,
-    and replaces the TwiML with a friendly fallback if the TTS URL is not fetchable.
+    Improved logic:
+      - Verify Play URL reachability using a small ranged GET (works with some S3 configs
+        where HEAD is rejected).
+      - If TTS URL is unreachable, *never* attempt to play it. Use a friendly fallback TwiML
+        and create an outbound call to play that friendly message (no technical wording).
     """
     try:
-        # If twiml contains a <Play> tag, extract the URL and verify it's reachable by Twilio
         play_url = None
         try:
             lower = twiml.lower()
             if "<play>" in lower and "</play>" in lower:
-                # very small, conservative extraction (not XML parser to keep it simple)
                 start = lower.index("<play>") + len("<play>")
                 end = lower.index("</play>", start)
                 play_url = twiml[start:end].strip()
@@ -395,23 +394,35 @@ def _safe_update_or_call(call_sid: str, from_number: Optional[str], twiml: str):
         except Exception:
             play_url = None
 
-        head_ok = True
+        # Try small ranged GET (0-0) instead of HEAD — some S3 configs block HEAD.
+        url_ok = True
         if play_url:
             try:
-                # HEAD to verify resource is reachable (short timeouts)
-                h = requests.head(play_url, timeout=(3, 8))
-                head_ok = (h.status_code == 200)
-                logger.info("[%s] HEAD %s -> %s", call_sid, play_url, h.status_code)
+                # Request only first byte; faster and works around some HEAD-blocking policies.
+                headers = {"Range": "bytes=0-0"}
+                rchk = requests.get(play_url, headers=headers, timeout=(3, 8), stream=True)
+                # Accept 200 (full content) or 206 (partial content due to range)
+                if rchk.status_code in (200, 206):
+                    url_ok = True
+                    logger.info("[%s] ranged-GET %s -> %s", call_sid, play_url, rchk.status_code)
+                else:
+                    url_ok = False
+                    logger.warning("[%s] ranged-GET %s -> %s (not OK)", call_sid, play_url, rchk.status_code)
+                # close stream if any
+                try:
+                    rchk.close()
+                except Exception:
+                    pass
             except Exception:
-                head_ok = False
-                logger.exception("[%s] Error while HEADing Play URL %s", call_sid, play_url)
+                url_ok = False
+                logger.exception("[%s] Error during ranged GET for Play URL %s", call_sid, play_url)
 
-        # If the Play URL is present but not reachable, replace twiml with a friendly fallback message.
-        if play_url and not head_ok:
-            logger.warning("[%s] Play URL not reachable; using friendly fallback TwiML instead of technical error.", call_sid)
-            twiml = "<Response><Say>Sorry — I couldn't prepare your voice response right now. We'll call you back shortly.</Say></Response>"
+        # If Play URL exists but is not reachable, replace twiml with friendly fallback.
+        if play_url and not url_ok:
+            logger.warning("[%s] Play URL unreachable; using friendly fallback TwiML.", call_sid)
+            twiml = "<Response><Say>Sorry — I couldn't generate your voice response right now. We'll call you back shortly.</Say></Response>"
 
-        # Fetch call status
+        # Fetch call status to decide whether redirect is allowed
         call = None
         try:
             if twilio_client:
@@ -420,7 +431,7 @@ def _safe_update_or_call(call_sid: str, from_number: Optional[str], twiml: str):
         except Exception:
             logger.exception("[%s] Failed to fetch call status", call_sid)
 
-        # If call is in-progress (or ringing/queued), update it
+        # If call is in-progress (or ringing/queued), try to update it
         if call and getattr(call, "status", "").lower() in ("in-progress", "ringing", "queued"):
             try:
                 twilio_client.calls(call_sid).update(twiml=twiml)
@@ -429,23 +440,23 @@ def _safe_update_or_call(call_sid: str, from_number: Optional[str], twiml: str):
             except Exception:
                 logger.exception("[%s] Failed to update live call; will attempt outbound fallback.", call_sid)
 
-        # If call isn't in-progress, attempt to create outbound call that plays the twiml (which may be Play or friendly Say)
+        # If cannot update live call, create outbound call. Use twiml (which may be Play or friendly Say).
         if from_number and TWILIO_FROM:
             try:
-                new_call = twilio_client.calls.create(
+                created = twilio_client.calls.create(
                     to=from_number,
                     from_=TWILIO_FROM,
-                    twiml=twiml,
+                    twiml=twiml
                 )
-                logger.info("[%s] Created fallback outbound call %s", call_sid, new_call.sid)
+                logger.info("[%s] Created fallback outbound call %s", call_sid, created.sid)
                 return
             except Exception:
                 logger.exception("[%s] Failed to create fallback outbound call", call_sid)
 
-        logger.warning("[%s] No viable path to update or outbound-call; giving up.", call_sid)
+        logger.warning("[%s] No viable path to update or create outbound call; giving up.", call_sid)
 
     except Exception as e:
-        logger.exception("[%s] safe_update_or_call failed: %s", call_sid, e)
+        logger.exception("[%s] safe_update_or_call unexpected error: %s", call_sid, e)
 
 # ---------------- optional outbound call endpoint ----------------
 @app.post("/call_outbound")
