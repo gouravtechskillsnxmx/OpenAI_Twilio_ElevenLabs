@@ -239,7 +239,7 @@ async def twiml(request: Request):
     resp.say("Hello, this is our AI assistant. Please say something after the beep.", voice="alice")
     action = recording_callback_url()
     # short record for responsive loop
-    resp.record(max_length=6, action=action, play_beep=True, timeout=2)
+    resp.record(max_length=30, action=action, play_beep=True, timeout=2)
     return Response(content=str(resp), media_type="text/xml")
 
 # ---------------- recording webhook ----------------
@@ -374,28 +374,32 @@ async def process_recording_background(call_sid: str, recording_url: str, from_n
 def _safe_update_or_call(call_sid: str, from_number: Optional[str], twiml: str):
     """
     Safely update an in-progress Twilio call or, if ended, create a new outbound call.
-    Fix: unescape HTML entities in extracted Play URL (e.g. &amp; -> &) before HTTP checks.
+    - Unescape HTML entities in extracted Play URL (fix &amp; -> &).
+    - Validate Play URL via a small ranged GET (accept 200 or 206).
+    - If Play URL invalid, swap to a friendly <Say> twiml (no technical wording).
+    - When creating outbound call, wrap TwiML safely with VoiceResponse and include status_callback.
     """
     try:
         play_url = None
+        url_ok = True
+
+        # Extract <Play> content (conservative string search) and unescape HTML entities
         try:
             lower = twiml.lower()
             if "<play>" in lower and "</play>" in lower:
                 start = lower.index("<play>") + len("<play>")
                 end = lower.index("</play>", start)
                 play_url = twiml[start:end].strip()
-                # --- NEW: unescape HTML entities (fixes &amp; -> & in S3 presigned URLs) ---
                 import html as _html
                 play_url = _html.unescape(play_url)
-                # remove accidental surrounding quotes
+                # trim any accidental quotes
                 if play_url.startswith('"') and play_url.endswith('"'):
                     play_url = play_url[1:-1]
                 logger.info("[%s] extracted/unescaped Play URL for verification: %s", call_sid, play_url)
         except Exception:
             play_url = None
 
-        # Try small ranged GET (0-0) — accept 200 or 206 as OK
-        url_ok = True
+        # Verify Play URL quickly with a small ranged GET (works when HEAD may be blocked)
         if play_url:
             try:
                 headers = {"Range": "bytes=0-0"}
@@ -415,41 +419,84 @@ def _safe_update_or_call(call_sid: str, from_number: Optional[str], twiml: str):
                 url_ok = False
                 logger.exception("[%s] Error during ranged GET for Play URL %s", call_sid, play_url)
 
-        # If Play URL exists but is not reachable, replace twiml with friendly fallback.
+        # If Play URL exists but is not reachable, replace twiml with a friendly fallback Say
         if play_url and not url_ok:
             logger.warning("[%s] Play URL unreachable; using friendly fallback TwiML.", call_sid)
             twiml = "<Response><Say>Sorry — I couldn't generate your voice response right now. We'll call you back shortly.</Say></Response>"
 
-        # Fetch call status
+        # Try fetching call status to decide if redirect allowed
         call = None
         try:
             if twilio_client:
                 call = twilio_client.calls(call_sid).fetch()
                 logger.info("[%s] fetched call status=%s", call_sid, getattr(call, "status", None))
-        except Exception:
-            logger.exception("[%s] Failed to fetch call status", call_sid)
+        except Exception as e:
+            # log details but continue to fallback behavior
+            logger.exception("[%s] Failed to fetch call status: %s", call_sid, e)
 
-        # If call is in-progress (or ringing/queued), update it
+        # If call is in-progress (or ringing/queued), attempt to update it
         if call and getattr(call, "status", "").lower() in ("in-progress", "ringing", "queued"):
             try:
                 twilio_client.calls(call_sid).update(twiml=twiml)
                 logger.info("[%s] Successfully updated live call.", call_sid)
                 return
-            except Exception:
-                logger.exception("[%s] Failed to update live call; will attempt outbound fallback.", call_sid)
+            except Exception as e:
+                logger.exception("[%s] Failed to update live call; will attempt outbound fallback. Error: %s", call_sid, e)
 
-        # If cannot update live call, create outbound call. Use twiml (which may be Play or friendly Say).
+        # If cannot update live call or call is completed, create an outbound fallback call (if we have a number)
         if from_number and TWILIO_FROM:
             try:
+                # small delay to avoid racing Twilio teardown/recreate edge cases
+                import time as _time
+                _time.sleep(0.5)
+
+                # status_callback so we can inspect Twilio lifecycle (helpful for debugging)
+                status_cb = f"https://{HOSTNAME}/call_status" if HOSTNAME else None
+
+                # Build safe VoiceResponse for the outbound call:
+                resp = VoiceResponse()
+                # If original twiml had a Play and that URL was validated OK, include it.
+                if play_url and url_ok:
+                    # optional short message first then play
+                    resp.say("Here's the information you asked for.", voice="alice")
+                    resp.play(play_url)
+                else:
+                    # Use friendly Say fallback so Twilio won't try to fetch a broken/forbidden URL
+                    # Try to extract a short textual reply from twiml if possible (very simple attempt)
+                    short_text = None
+                    try:
+                        # look for a <Say> in the twiml and use that text (unescape if found)
+                        low = twiml.lower()
+                        if "<say>" in low and "</say>" in low:
+                            s = low.index("<say>") + len("<say>")
+                            e = low.index("</say>", s)
+                            short_text = twiml[s:e].strip()
+                            import html as _html
+                            short_text = _html.unescape(short_text)
+                    except Exception:
+                        short_text = None
+
+                    if short_text:
+                        # truncate to safe length
+                        st = short_text.strip()
+                        if len(st) > 300:
+                            st = st[:297] + "..."
+                        resp.say(st, voice="alice")
+                    else:
+                        resp.say("Sorry — I couldn't generate your voice response right now. We'll call you back shortly.", voice="alice")
+
+                # Create outbound call with the constructed safe TwiML
                 created = twilio_client.calls.create(
                     to=from_number,
                     from_=TWILIO_FROM,
-                    twiml=twiml
+                    twiml=str(resp),
+                    status_callback=status_cb,
+                    status_callback_event=["initiated", "ringing", "answered", "completed"] if status_cb else None
                 )
-                logger.info("[%s] Created fallback outbound call %s", call_sid, created.sid)
+                logger.info("[%s] Created fallback outbound call %s", call_sid, getattr(created, "sid", created))
                 return
-            except Exception:
-                logger.exception("[%s] Failed to create fallback outbound call", call_sid)
+            except Exception as e:
+                logger.exception("[%s] Failed to create fallback outbound call: %s", call_sid, e)
 
         logger.warning("[%s] No viable path to update or create outbound call; giving up.", call_sid)
 
