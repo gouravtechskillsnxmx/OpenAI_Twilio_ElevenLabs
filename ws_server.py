@@ -292,60 +292,168 @@ from twilio.twiml.voice_response import VoiceResponse
 
 from fastapi import Response
 
+# ======= BEGIN DROP-IN PATCH: robust hold flow (paste into ws_server.py) =======
+import os, json, logging, html
+from typing import Optional
+from fastapi import Request, Response, Query
+from urllib.parse import urlencode
+from twilio.twiml.voice_response import VoiceResponse
+# logger assumed existing in file (logger). If not, use:
+# logger = logging.getLogger("ws_server")
+
+# -------- resilient hold_store: attempt Redis, else in-memory fallback --------
+REDIS_URL = os.environ.get("REDIS_URL")
+redis_client = None
+if REDIS_URL:
+    try:
+        import redis  # pip package redis
+        redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+    except Exception as e:
+        logger.warning("Redis init failed, will use in-memory hold_store: %s", e)
+        redis_client = None
+
+_hmem = {}
+
+class HoldStore:
+    @staticmethod
+    def set_ready(convo_id: str, payload: dict, expire: int = 3600):
+        """
+        Store payload (e.g. {"tts_url": "..."}). On Redis error fallback to memory.
+        """
+        if redis_client:
+            try:
+                redis_client.set(f"hold:{convo_id}", json.dumps(payload), ex=expire)
+                return
+            except Exception as e:
+                logger.warning("Redis set failed, falling back in-memory: %s", e)
+        # in-memory fallback (non-persistent across processes)
+        _hmem[convo_id] = {"payload": payload}
+
+    @staticmethod
+    def get_ready(convo_id: str) -> Optional[dict]:
+        if redis_client:
+            try:
+                v = redis_client.get(f"hold:{convo_id}")
+                return json.loads(v) if v else None
+            except Exception as e:
+                logger.warning("Redis get failed, using in-memory fallback: %s", e)
+        item = _hmem.get(convo_id)
+        return item.get("payload") if item else None
+
+    @staticmethod
+    def clear(convo_id: str):
+        if redis_client:
+            try:
+                redis_client.delete(f"hold:{convo_id}")
+            except Exception as e:
+                logger.warning("Redis delete failed, clearing in-memory: %s", e)
+        _hmem.pop(convo_id, None)
+
+hold_store = HoldStore()
+# ---------------------------------------------------------------------------
+
+def _unescape_url(u: Optional[str]) -> Optional[str]:
+    """Unescape HTML entities (e.g. &amp; -> &) and strip quotes."""
+    if not u:
+        return None
+    try:
+        u2 = html.unescape(u)
+        if u2.startswith('"') and u2.endswith('"'):
+            u2 = u2[1:-1]
+        return u2
+    except Exception:
+        return u
+
+# -------------------- /recording endpoint (Twilio Record action) --------------------
+# Replace existing recording handler with this (works with app = FastAPI())
+@app.post("/recording")
+async def recording(request: Request):
+    """
+    Twilio Record action must return valid TwiML. We immediately respond with a
+    redirect to /hold?convo_id=<CallSid> to avoid Twilio's 'application error'.
+    """
+    try:
+        form = await request.form()
+        convo_id = form.get("CallSid") or form.get("convo_id")
+        # Build redirect URL that Twilio can fetch - must be publicly reachable (HOSTNAME env)
+        params = {"convo_id": convo_id}
+        redirect_url = f"https://{HOSTNAME}/hold?{urlencode(params)}" if HOSTNAME else f"/hold?{urlencode(params)}"
+        resp = VoiceResponse()
+        resp.say("Thanks — please hold while I prepare your response.", voice="alice")
+        resp.redirect(redirect_url)
+        return Response(content=str(resp), media_type="text/xml")
+    except Exception as e:
+        # In the unlikely event parsing fails, return a friendly TwiML (never 204/500).
+        logger.exception("Exception in /recording handler: %s", e)
+        resp = VoiceResponse()
+        resp.say("We're having trouble processing your recording. Please stay on the line.", voice="alice")
+        resp.pause(length=5)
+        resp.redirect("/hold?convo_id=unknown")
+        return Response(content=str(resp), media_type="text/xml")
+
+# -------------------- /hold endpoint (poll until ready) --------------------
 @app.post("/hold")
 @app.get("/hold")
 async def hold(request: Request, convo_id: str = Query(...)):
     """
-    If TTS is ready for convo_id -> return Play+Record (final TwiML).
-    If not ready -> pause then redirect back to /hold (loop).
+    Polls hold_store for readiness:
+      - If ready: return Play(tts_url) + Record (final TwiML), then clear store.
+      - If not ready: Pause then Redirect back to /hold (loop).
+    This handler is hardened: any internal error results in valid TwiML (no 500).
     """
-    ready = hold_store.get_ready(convo_id)
-    if ready:
-        tts_url = ready.get("tts_url")
-        final_twiml = ready.get("twiml")
+    try:
+        ready = None
+        try:
+            ready = hold_store.get_ready(convo_id)
+        except Exception as e:
+            logger.warning("hold_store.get_ready error (continuing with None): %s", e)
+            ready = None
+
+        if ready:
+            # ready payload must contain either 'tts_url' or 'twiml'
+            tts_url = _unescape_url(ready.get("tts_url")) if isinstance(ready, dict) else None
+            final_twiml = ready.get("twiml") if isinstance(ready, dict) else None
+
+            resp = VoiceResponse()
+            if tts_url:
+                # Play TTS then allow user to record a followup.
+                resp.play(tts_url)
+                resp.record(
+                    max_length=20,
+                    action=f"https://{HOSTNAME}/recording" if HOSTNAME else "/recording",
+                    play_beep=True,
+                    timeout=2,
+                )
+            elif final_twiml:
+                # If raw twiml provided, return it directly
+                return Response(content=final_twiml, media_type="text/xml")
+            else:
+                resp.say("Sorry — we couldn't prepare your response. We'll call you back shortly.", voice="alice")
+
+            # Clear readiness state so next interaction starts fresh
+            try:
+                hold_store.clear(convo_id)
+            except Exception as e:
+                logger.warning("hold_store.clear failed: %s", e)
+
+            return Response(content=str(resp), media_type="text/xml")
+
+        # Not ready -> pause then redirect back to /hold (poll loop).
         resp = VoiceResponse()
-        if tts_url:
-            resp.play(tts_url)
-            resp.record(
-                max_length=20,
-                action=f"https://{HOSTNAME}/recording" if HOSTNAME else "/recording",
-                play_beep=True,
-                timeout=2,
-            )
-        elif final_twiml:
-            return Response(content=final_twiml, media_type="text/xml")
-        else:
-            resp.say("Sorry — something went wrong preparing the reply.", voice="alice")
-        hold_store.clear(convo_id)
+        resp.pause(length=5)  # poll interval (tune if necessary)
+        redirect_url = f"https://{HOSTNAME}/hold?convo_id={convo_id}" if HOSTNAME else f"/hold?convo_id={convo_id}"
+        resp.redirect(redirect_url)
         return Response(content=str(resp), media_type="text/xml")
 
-    # Not ready — pause + redirect loop
-    resp = VoiceResponse()
-    resp.pause(length=5)
-    redirect_url = f"https://{HOSTNAME}/hold?convo_id={convo_id}" if HOSTNAME else f"/hold?convo_id={convo_id}"
-    resp.redirect(redirect_url)
-    return Response(content=str(resp), media_type="text/xml")
-
-from fastapi import Request, Response
-from twilio.twiml.voice_response import VoiceResponse
-from urllib.parse import urlencode
-
-@app.post("/recording")
-async def recording(request: Request):
-    """
-    Twilio Record action handler:
-    - Immediately respond with TwiML that redirects caller to /hold?convo_id=...
-    - Prevents Twilio from playing 'application error' and keeps caller alive.
-    """
-    form = await request.form()
-    convo_id = form.get("CallSid") or form.get("convo_id")
-    params = {"convo_id": convo_id}
-    redirect_url = f"https://{HOSTNAME}/hold?{urlencode(params)}" if HOSTNAME else f"/hold?{urlencode(params)}"
-
-    resp = VoiceResponse()
-    resp.say("Thanks — please hold while I prepare your response.", voice="alice")
-    resp.redirect(redirect_url)
-    return Response(content=str(resp), media_type="text/xml")
+    except Exception as e:
+        logger.exception("Unexpected error in /hold: %s", e)
+        # Last-resort: return safe TwiML that keeps caller on the line
+        resp = VoiceResponse()
+        resp.say("Please hold while we prepare your response.", voice="alice")
+        resp.pause(length=5)
+        resp.redirect(f"/hold?convo_id={convo_id}")
+        return Response(content=str(resp), media_type="text/xml")
+# ======= END DROP-IN PATCH =======
 
 
 # ---------------- background pipeline ----------------
