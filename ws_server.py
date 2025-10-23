@@ -374,11 +374,7 @@ async def process_recording_background(call_sid: str, recording_url: str, from_n
 def _safe_update_or_call(call_sid: str, from_number: Optional[str], twiml: str):
     """
     Safely update an in-progress Twilio call or, if ended, create a new outbound call.
-    Improved logic:
-      - Verify Play URL reachability using a small ranged GET (works with some S3 configs
-        where HEAD is rejected).
-      - If TTS URL is unreachable, *never* attempt to play it. Use a friendly fallback TwiML
-        and create an outbound call to play that friendly message (no technical wording).
+    Fix: unescape HTML entities in extracted Play URL (e.g. &amp; -> &) before HTTP checks.
     """
     try:
         play_url = None
@@ -388,25 +384,29 @@ def _safe_update_or_call(call_sid: str, from_number: Optional[str], twiml: str):
                 start = lower.index("<play>") + len("<play>")
                 end = lower.index("</play>", start)
                 play_url = twiml[start:end].strip()
-                logger.info("[%s] extracted Play URL for verification: %s", call_sid, play_url)
+                # --- NEW: unescape HTML entities (fixes &amp; -> & in S3 presigned URLs) ---
+                import html as _html
+                play_url = _html.unescape(play_url)
+                # remove accidental surrounding quotes
+                if play_url.startswith('"') and play_url.endswith('"'):
+                    play_url = play_url[1:-1]
+                logger.info("[%s] extracted/unescaped Play URL for verification: %s", call_sid, play_url)
         except Exception:
             play_url = None
 
-        # Try small ranged GET (0-0) instead of HEAD — some S3 configs block HEAD.
+        # Try small ranged GET (0-0) — accept 200 or 206 as OK
         url_ok = True
         if play_url:
             try:
-                # Request only first byte; faster and works around some HEAD-blocking policies.
                 headers = {"Range": "bytes=0-0"}
                 rchk = requests.get(play_url, headers=headers, timeout=(3, 8), stream=True)
-                # Accept 200 (full content) or 206 (partial content due to range)
-                if rchk.status_code in (200, 206):
+                status = getattr(rchk, "status_code", None)
+                if status in (200, 206):
                     url_ok = True
-                    logger.info("[%s] ranged-GET %s -> %s", call_sid, play_url, rchk.status_code)
+                    logger.info("[%s] ranged-GET %s -> %s", call_sid, play_url, status)
                 else:
                     url_ok = False
-                    logger.warning("[%s] ranged-GET %s -> %s (not OK)", call_sid, play_url, rchk.status_code)
-                # close stream if any
+                    logger.warning("[%s] ranged-GET %s -> %s (not OK)", call_sid, play_url, status)
                 try:
                     rchk.close()
                 except Exception:
@@ -420,7 +420,7 @@ def _safe_update_or_call(call_sid: str, from_number: Optional[str], twiml: str):
             logger.warning("[%s] Play URL unreachable; using friendly fallback TwiML.", call_sid)
             twiml = "<Response><Say>Sorry — I couldn't generate your voice response right now. We'll call you back shortly.</Say></Response>"
 
-        # Fetch call status to decide whether redirect is allowed
+        # Fetch call status
         call = None
         try:
             if twilio_client:
@@ -429,7 +429,7 @@ def _safe_update_or_call(call_sid: str, from_number: Optional[str], twiml: str):
         except Exception:
             logger.exception("[%s] Failed to fetch call status", call_sid)
 
-        # If call is in-progress (or ringing/queued), try to update it
+        # If call is in-progress (or ringing/queued), update it
         if call and getattr(call, "status", "").lower() in ("in-progress", "ringing", "queued"):
             try:
                 twilio_client.calls(call_sid).update(twiml=twiml)
