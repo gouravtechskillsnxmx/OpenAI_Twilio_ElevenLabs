@@ -80,6 +80,46 @@ if AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY:
 else:
     s3 = boto3.client("s3", region_name=AWS_REGION)
 
+# hold_store helper — uses Redis if REDIS_URL env var present, else in-memory (single-process only).
+import os
+import json
+from typing import Optional
+
+REDIS_URL = os.environ.get("REDIS_URL")
+
+if REDIS_URL:
+    import redis
+    redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+
+    class HoldStoreRedis:
+        @staticmethod
+        def set_ready(convo_id: str, payload: dict, expire: int = 3600):
+            redis_client.set(f"hold:{convo_id}", json.dumps(payload), ex=expire)
+        @staticmethod
+        def get_ready(convo_id: str) -> Optional[dict]:
+            v = redis_client.get(f"hold:{convo_id}")
+            return json.loads(v) if v else None
+        @staticmethod
+        def clear(convo_id: str):
+            redis_client.delete(f"hold:{convo_id}")
+
+    hold_store = HoldStoreRedis()
+else:
+    # WARNING: in-memory only works for single-process, non-production
+    _HOLD_MEM = {}
+    class HoldStoreMem:
+        @staticmethod
+        def set_ready(convo_id: str, payload: dict, expire: int = 3600):
+            _HOLD_MEM[convo_id] = payload
+        @staticmethod
+        def get_ready(convo_id: str) -> Optional[dict]:
+            return _HOLD_MEM.get(convo_id)
+        @staticmethod
+        def clear(convo_id: str):
+            _HOLD_MEM.pop(convo_id, None)
+    hold_store = HoldStoreMem()
+
+
 # ---------------- health ----------------
 @app.get("/health")
 async def health():
@@ -243,22 +283,70 @@ async def twiml(request: Request):
     return Response(content=str(resp), media_type="text/xml")
 
 # ---------------- recording webhook ----------------
+from fastapi import Request, Response
+from twilio.twiml.voice_response import VoiceResponse
+from urllib.parse import urlencode
+
+from fastapi import Query
+from twilio.twiml.voice_response import VoiceResponse
+
+from fastapi import Response
+
+@app.post("/hold")
+@app.get("/hold")
+async def hold(request: Request, convo_id: str = Query(...)):
+    """
+    If TTS is ready for convo_id -> return Play+Record (final TwiML).
+    If not ready -> pause then redirect back to /hold (loop).
+    """
+    ready = hold_store.get_ready(convo_id)
+    if ready:
+        tts_url = ready.get("tts_url")
+        final_twiml = ready.get("twiml")
+        resp = VoiceResponse()
+        if tts_url:
+            resp.play(tts_url)
+            resp.record(
+                max_length=20,
+                action=f"https://{HOSTNAME}/recording" if HOSTNAME else "/recording",
+                play_beep=True,
+                timeout=2,
+            )
+        elif final_twiml:
+            return Response(content=final_twiml, media_type="text/xml")
+        else:
+            resp.say("Sorry — something went wrong preparing the reply.", voice="alice")
+        hold_store.clear(convo_id)
+        return Response(content=str(resp), media_type="text/xml")
+
+    # Not ready — pause + redirect loop
+    resp = VoiceResponse()
+    resp.pause(length=5)
+    redirect_url = f"https://{HOSTNAME}/hold?convo_id={convo_id}" if HOSTNAME else f"/hold?convo_id={convo_id}"
+    resp.redirect(redirect_url)
+    return Response(content=str(resp), media_type="text/xml")
+
+from fastapi import Request, Response
+from twilio.twiml.voice_response import VoiceResponse
+from urllib.parse import urlencode
+
 @app.post("/recording")
-async def recording(request: Request, background_tasks: BackgroundTasks):
+async def recording(request: Request):
+    """
+    Twilio Record action handler:
+    - Immediately respond with TwiML that redirects caller to /hold?convo_id=...
+    - Prevents Twilio from playing 'application error' and keeps caller alive.
+    """
     form = await request.form()
-    payload = dict(form)
-    recording_url = payload.get("RecordingUrl")
-    call_sid = payload.get("CallSid")
-    from_number = payload.get("From")
-    logger.info("Incoming recording webhook: CallSid=%s From=%s RecordingUrl=%s", call_sid, from_number, recording_url)
+    convo_id = form.get("CallSid") or form.get("convo_id")
+    params = {"convo_id": convo_id}
+    redirect_url = f"https://{HOSTNAME}/hold?{urlencode(params)}" if HOSTNAME else f"/hold?{urlencode(params)}"
 
-    if not recording_url or not call_sid:
-        logger.warning("Missing RecordingUrl or CallSid in request payload: %s", payload)
-        return JSONResponse({"error": "missing RecordingUrl or CallSid"}, status_code=400)
+    resp = VoiceResponse()
+    resp.say("Thanks — please hold while I prepare your response.", voice="alice")
+    resp.redirect(redirect_url)
+    return Response(content=str(resp), media_type="text/xml")
 
-    # ACK quickly and process in background
-    background_tasks.add_task(process_recording_background, call_sid, recording_url, from_number)
-    return Response(status_code=204)
 
 # ---------------- background pipeline ----------------
 import os, tempfile, requests, logging
@@ -342,6 +430,8 @@ async def process_recording_background(call_sid: str, recording_url: str, from_n
         tts_url = None
         try:
             tts_url = create_and_upload_tts(reply_text)
+            # after tts_url is available, set hold_store so /hold will serve it
+            hold_store.set_ready(call_sid, {"tts_url": tts_url})
             logger.info("[%s] tts_url: %s", call_sid, tts_url)
         except Exception as e:
             logger.exception("[%s] TTS/upload failed: %s", call_sid, e)
