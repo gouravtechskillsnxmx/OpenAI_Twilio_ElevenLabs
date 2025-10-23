@@ -86,6 +86,14 @@ async def health():
     return {"status": "ok", "hostname": HOSTNAME}
 
 # ---------------- helpers ----------------
+
+from fastapi import FastAPI
+app = app  # assume your FastAPI app is named app
+
+@app.get("/debug/ping")
+async def debug_ping():
+    return {"ok": True, "service": "agent-server-ms", "ts": __import__("time").time()}
+
 def recording_callback_url() -> str:
     if HOSTNAME:
         return f"https://{HOSTNAME}/recording"
@@ -273,7 +281,7 @@ async def process_recording_background(call_sid: str, recording_url: str, from_n
     try:
         download_url = build_download_url(recording_url)
         auth = HTTPBasicAuth(TWILIO_SID, TWILIO_TOKEN) if (
-											  
+                                              
             TWILIO_SID and TWILIO_TOKEN and "api.twilio.com" in download_url
         ) else None
 
@@ -284,7 +292,7 @@ async def process_recording_background(call_sid: str, recording_url: str, from_n
         except requests.exceptions.HTTPError as he:
             status = getattr(he.response, "status_code", None)
             logger.error("[%s] Download HTTP error %s: %s", call_sid, status, getattr(he.response, "text", str(he))[:400])
-							
+                            
             fallback_twiml = "<Response><Say>Sorry, we couldn't get your audio right now. Please try again later.</Say></Response>"
             _safe_update_or_call(call_sid, from_number, fallback_twiml)
             return
@@ -311,7 +319,7 @@ async def process_recording_background(call_sid: str, recording_url: str, from_n
         # 4️⃣ Agent call
         try:
             agent_out = call_agent_and_get_reply(call_sid, transcript)
-							  
+                              
             reply_text = (agent_out.get("reply_text") if isinstance(agent_out, dict) else str(agent_out)) or ""
             memory_writes = agent_out.get("memory_writes") if isinstance(agent_out, dict) else []
         except Exception as e:
@@ -339,20 +347,17 @@ async def process_recording_background(call_sid: str, recording_url: str, from_n
             logger.info("[%s] tts_url: %s", call_sid, tts_url)
         except Exception as e:
             logger.exception("[%s] TTS/upload failed: %s", call_sid, e)
-									
+                                    
             twiml = f"<Response><Say>{reply_text}</Say><Record maxLength='6' action='https://{HOSTNAME}/recording' playBeep='true' timeout='2'/></Response>"
-				
-								 
-																
-												
-									  
-																	 
-					 
-																 
-																																   
+                
+                                                                
+                                                 
+                                  
+                                                                 
+                                                                                                                                   
             _safe_update_or_call(call_sid, from_number, twiml)
-							 
-																				
+                             
+                                                                                
             return
 
         # 7️⃣ Build TwiML: Play + Record again
@@ -364,7 +369,7 @@ async def process_recording_background(call_sid: str, recording_url: str, from_n
 
         logger.info("[%s] updating Twilio call with Play+Record", call_sid)
         _safe_update_or_call(call_sid, from_number, twiml)
-							 
+                             
     except Exception as e:
         logger.exception("[%s] Unexpected pipeline error: %s", call_sid, e)
 
@@ -373,23 +378,72 @@ def _safe_update_or_call(call_sid: str, from_number: Optional[str], twiml: str):
     """
     Safely update an in-progress Twilio call or, if ended, create a new outbound call.
     Prevents Twilio 400/21220 errors ("Call is not in-progress. Cannot redirect.")
+    This version also validates any <Play> URL is reachable before attempting to redirect,
+    and replaces the TwiML with a friendly fallback if the TTS URL is not fetchable.
     """
     try:
-        call = twilio_client.calls(call_sid).fetch()
-        logger.info("[%s] fetched call status=%s", call_sid, call.status)
+        # If twiml contains a <Play> tag, extract the URL and verify it's reachable by Twilio
+        play_url = None
+        try:
+            lower = twiml.lower()
+            if "<play>" in lower and "</play>" in lower:
+                # very small, conservative extraction (not XML parser to keep it simple)
+                start = lower.index("<play>") + len("<play>")
+                end = lower.index("</play>", start)
+                play_url = twiml[start:end].strip()
+                logger.info("[%s] extracted Play URL for verification: %s", call_sid, play_url)
+        except Exception:
+            play_url = None
 
-        if call.status in ("in-progress", "ringing", "queued"):
-            twilio_client.calls(call_sid).update(twiml=twiml)
-            logger.info("[%s] Successfully updated live call.", call_sid)
-        else:
-            logger.warning("[%s] Call is %s; cannot redirect. Making new call if from_number exists.", call_sid, call.status)
-            if from_number and TWILIO_FROM:
+        head_ok = True
+        if play_url:
+            try:
+                # HEAD to verify resource is reachable (short timeouts)
+                h = requests.head(play_url, timeout=(3, 8))
+                head_ok = (h.status_code == 200)
+                logger.info("[%s] HEAD %s -> %s", call_sid, play_url, h.status_code)
+            except Exception:
+                head_ok = False
+                logger.exception("[%s] Error while HEADing Play URL %s", call_sid, play_url)
+
+        # If the Play URL is present but not reachable, replace twiml with a friendly fallback message.
+        if play_url and not head_ok:
+            logger.warning("[%s] Play URL not reachable; using friendly fallback TwiML instead of technical error.", call_sid)
+            twiml = "<Response><Say>Sorry — I couldn't prepare your voice response right now. We'll call you back shortly.</Say></Response>"
+
+        # Fetch call status
+        call = None
+        try:
+            if twilio_client:
+                call = twilio_client.calls(call_sid).fetch()
+                logger.info("[%s] fetched call status=%s", call_sid, getattr(call, "status", None))
+        except Exception:
+            logger.exception("[%s] Failed to fetch call status", call_sid)
+
+        # If call is in-progress (or ringing/queued), update it
+        if call and getattr(call, "status", "").lower() in ("in-progress", "ringing", "queued"):
+            try:
+                twilio_client.calls(call_sid).update(twiml=twiml)
+                logger.info("[%s] Successfully updated live call.", call_sid)
+                return
+            except Exception:
+                logger.exception("[%s] Failed to update live call; will attempt outbound fallback.", call_sid)
+
+        # If call isn't in-progress, attempt to create outbound call that plays the twiml (which may be Play or friendly Say)
+        if from_number and TWILIO_FROM:
+            try:
                 new_call = twilio_client.calls.create(
                     to=from_number,
                     from_=TWILIO_FROM,
                     twiml=twiml,
                 )
                 logger.info("[%s] Created fallback outbound call %s", call_sid, new_call.sid)
+                return
+            except Exception:
+                logger.exception("[%s] Failed to create fallback outbound call", call_sid)
+
+        logger.warning("[%s] No viable path to update or outbound-call; giving up.", call_sid)
+
     except Exception as e:
         logger.exception("[%s] safe_update_or_call failed: %s", call_sid, e)
 
@@ -399,7 +453,7 @@ async def call_outbound(request: Request):
     """
     Trigger an outbound call from Twilio => to_number.
     Must set TWILIO_FROM env. Useful to avoid dialing Twilio number from an international mobile.
-    body form: to_number=+91....
+    body form: to_number=+91...."
     """
     form = await request.form()
     to_number = form.get("to_number")
@@ -414,4 +468,3 @@ async def call_outbound(request: Request):
     except Exception as e:
         logger.exception("Failed to create outbound call to %s: %s", to_number, e)
         return JSONResponse({"error": "call failed"}, status_code=500)
-
