@@ -268,39 +268,37 @@ from typing import Optional
 
 async def process_recording_background(call_sid: str, recording_url: str, from_number: Optional[str] = None):
     """
-    Background pipeline:
-    1) Download recording (with Twilio basic auth if Twilio URL)
-    2) Transcribe via OpenAI
-    3) Call agent (or fallback)
-    4) Handle memory writes
-    5) Generate TTS, upload to S3
-    6) Safely update Twilio call or fallback to outbound call
+    Background pipeline (updated TwiML construction to avoid malformed XML/application error):
+    - identical flow to your previous function, but builds TwiML using VoiceResponse()
+      to ensure valid XML and proper escaping for <Say>/<Play>.
     """
     logger.info("[%s] background start - download_url=%s", call_sid, recording_url)
 
     try:
         download_url = build_download_url(recording_url)
         auth = HTTPBasicAuth(TWILIO_SID, TWILIO_TOKEN) if (
-                                              
-            TWILIO_SID and TWILIO_TOKEN and "api.twilio.com" in download_url
+            TWILIO_SID and TWILIO_TOKEN and "api.twilio.com" in (download_url or "")
         ) else None
 
-        # 1️⃣ Download recording
+        # 1) Download recording
         try:
             r = requests.get(download_url, auth=auth, timeout=30)
             r.raise_for_status()
         except requests.exceptions.HTTPError as he:
             status = getattr(he.response, "status_code", None)
-            logger.error("[%s] Download HTTP error %s: %s", call_sid, status, getattr(he.response, "text", str(he))[:400])
-                            
-            fallback_twiml = "<Response><Say>Sorry, we couldn't get your audio right now. Please try again later.</Say></Response>"
-            _safe_update_or_call(call_sid, from_number, fallback_twiml)
+            logger.error("[%s] Download HTTP error %s: %s", call_sid, status,
+                         getattr(he.response, "text", str(he))[:400])
+            # Friendly fallback TwiML
+            resp = VoiceResponse()
+            resp.say("Sorry, we couldn't get your audio right now. Please try again later.", voice="alice")
+            # Use the safe update/helper to update or create outbound call
+            _safe_update_or_call(call_sid, from_number, str(resp))
             return
         except Exception as e:
             logger.exception("[%s] Download failed: %s", call_sid, e)
             return
 
-        # 2️⃣ Save temp file
+        # 2) Save audio to temp file
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
         tmp.write(r.content)
         tmp.flush()
@@ -308,7 +306,7 @@ async def process_recording_background(call_sid: str, recording_url: str, from_n
         file_path = tmp.name
         logger.info("[%s] saved recording to %s", call_sid, file_path)
 
-        # 3️⃣ Transcribe
+        # 3) Transcribe
         try:
             transcript = transcribe_with_openai(file_path)
             logger.info("[%s] transcript: %s", call_sid, transcript)
@@ -316,10 +314,9 @@ async def process_recording_background(call_sid: str, recording_url: str, from_n
             logger.exception("[%s] STT/transcription failed: %s", call_sid, e)
             transcript = ""
 
-        # 4️⃣ Agent call
+        # 4) Agent call
         try:
             agent_out = call_agent_and_get_reply(call_sid, transcript)
-                              
             reply_text = (agent_out.get("reply_text") if isinstance(agent_out, dict) else str(agent_out)) or ""
             memory_writes = agent_out.get("memory_writes") if isinstance(agent_out, dict) else []
         except Exception as e:
@@ -327,9 +324,9 @@ async def process_recording_background(call_sid: str, recording_url: str, from_n
             reply_text = "Sorry, I'm having trouble right now."
             memory_writes = []
 
-        logger.info("[%s] assistant reply: %s", call_sid, reply_text[:300] + ("..." if len(reply_text) > 300 else ""))
+        logger.info("[%s] assistant reply (truncated): %s", call_sid, (reply_text[:300] + "...") if len(reply_text) > 300 else reply_text)
 
-        # 5️⃣ Write memory facts if any
+        # 5) Persist memory writes (unchanged)
         if memory_writes and isinstance(memory_writes, list):
             for mw in memory_writes:
                 try:
@@ -341,37 +338,38 @@ async def process_recording_background(call_sid: str, recording_url: str, from_n
                 except Exception:
                     logger.exception("[%s] failed to write memory: %s", call_sid, mw)
 
-        # 6️⃣ TTS & upload
+        # 6) TTS & upload
+        tts_url = None
         try:
             tts_url = create_and_upload_tts(reply_text)
             logger.info("[%s] tts_url: %s", call_sid, tts_url)
         except Exception as e:
             logger.exception("[%s] TTS/upload failed: %s", call_sid, e)
-                                    
-            twiml = f"<Response><Say>{reply_text}</Say><Record maxLength='6' action='https://{HOSTNAME}/recording' playBeep='true' timeout='2'/></Response>"
-                
-                                                                
-                                                 
-                                  
-                                                                 
-                                                                                                                                   
-            _safe_update_or_call(call_sid, from_number, twiml)
-                             
-                                                                                
+            # Fallback: Say the reply_text (safely) then Record
+            resp = VoiceResponse()
+            # Limit length to avoid Twilio truncation / invalid TwiML
+            safe_text = (reply_text or "Sorry, I'm having trouble right now.").strip()
+            # truncate to 300 chars for Say to keep TwiML safe
+            if len(safe_text) > 300:
+                safe_text = safe_text[:297] + "..."
+            resp.say(safe_text, voice="alice")
+            resp.record(max_length=6, action=recording_callback_url(), play_beep=True, timeout=2)
+            _safe_update_or_call(call_sid, from_number, str(resp))
             return
 
-        # 7️⃣ Build TwiML: Play + Record again
-        record_action = f"https://{HOSTNAME}/recording" if HOSTNAME else "/recording"
-        twiml = f"""<Response>
-            <Play>{tts_url}</Play>
-            <Record maxLength="6" action="{record_action}" playBeep="true" timeout="2" />
-        </Response>"""
+        # 7) Build TwiML safely with VoiceResponse: Play presigned URL then Record
+        resp = VoiceResponse()
+        # Play the presigned tts_url (already validated elsewhere). Using resp.play ensures proper escaping.
+        resp.play(tts_url)
+        resp.record(max_length=6, action=recording_callback_url(), play_beep=True, timeout=2)
+        twiml_str = str(resp)
 
         logger.info("[%s] updating Twilio call with Play+Record", call_sid)
-        _safe_update_or_call(call_sid, from_number, twiml)
-                             
+        _safe_update_or_call(call_sid, from_number, twiml_str)
+
     except Exception as e:
         logger.exception("[%s] Unexpected pipeline error: %s", call_sid, e)
+
 
 def _safe_update_or_call(call_sid: str, from_number: Optional[str], twiml: str):
     """
