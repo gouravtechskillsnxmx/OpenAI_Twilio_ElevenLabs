@@ -190,17 +190,29 @@ def create_tts_elevenlabs(text: str) -> bytes:
     r = requests.post(url, json=data, headers=headers, timeout=30)
     r.raise_for_status()
     return r.content
+#---------Chatgpt
+def create_and_upload_tts(text: str, expires_in: int = TTS_PRESIGNED_EXPIRES) -> Optional[str]:
+    try:
+        audio_bytes = create_tts_elevenlabs(text)
+    except requests.HTTPError as e:
+        # If ElevenLabs returns 401 — log and fallback to text-only response.
+        status = getattr(e.response, "status_code", None)
+        logger.error("ElevenLabs TTS failed (status=%s). Falling back to text. Error: %s", status, e)
+        # return None so caller will put reply_text into hold_store instead of tts_url
+        return None
+    except Exception:
+        logger.exception("Unexpected error creating TTS; falling back to text-only")
+        return None
 
-def create_and_upload_tts(text: str, expires_in: int = TTS_PRESIGNED_EXPIRES) -> str:
-    audio = create_tts_elevenlabs(text)
+    # existing S3 upload logic below (unchanged)...
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
-    tmp.write(audio)
+    tmp.write(audio_bytes)
+    tmp.flush()
     tmp.close()
     key = f"tts/{os.path.basename(tmp.name)}"
     s3.upload_file(tmp.name, S3_BUCKET, key, ExtraArgs={"ContentType": "audio/mpeg"})
-    url = s3.generate_presigned_url("get_object", Params={"Bucket": S3_BUCKET, "Key": key}, ExpiresIn=expires_in)
-    os.unlink(tmp.name)
-    return url
+    presigned = s3.generate_presigned_url("get_object", Params={"Bucket": S3_BUCKET, "Key": key}, ExpiresIn=expires_in)
+    return presigned
 
 # ---------------- AGENT ----------------
 def call_agent_and_get_reply(convo_id: str, user_text: str, timeout: int = 15) -> Dict[str, Any]:
