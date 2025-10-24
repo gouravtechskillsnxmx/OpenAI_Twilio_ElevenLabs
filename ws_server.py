@@ -269,11 +269,11 @@ async def recording(request: Request, background_tasks: BackgroundTasks):
 
     background_tasks.add_task(process_recording_background, call_sid, recording_url, from_number)
 
+    # FIXED: Manual URL with query param
+    hold_url = f"{request.base_url}hold?convo_id={call_sid}"
     resp = VoiceResponse()
-    hold_url = str(request.url_for("hold", convo_id=call_sid))
     resp.redirect(hold_url)
     return Response(content=str(resp), media_type="text/xml")
-
 # ---------------- BACKGROUND ----------------
 async def process_recording_background(call_sid: str, recording_url: str, from_number: Optional[str] = None):
     logger.info("[%s] Background start", call_sid)
@@ -340,9 +340,9 @@ async def hold(request: Request, convo_id: str = Query(...)):
             resp.record(max_length=30, action=recording_callback_url(), play_beep=True, timeout=2)
             return Response(content=str(resp), media_type="text/xml")
 
+        # Manual redirect URL
         base = str(request.base_url).rstrip("/")
-        path = str(request.url_for("hold", convo_id=convo_id))
-        redirect_url = f"{base}{path}"
+        redirect_url = f"{base}hold?convo_id={convo_id}"
 
         resp.say("Please hold while I prepare your response.", voice="alice")
         resp.pause(length=8)
@@ -354,7 +354,6 @@ async def hold(request: Request, convo_id: str = Query(...)):
         resp = VoiceResponse()
         resp.say("An error occurred.", voice="alice")
         return Response(content=str(resp), media_type="text/xml")
-
 # ---------------- HEALTH ----------------
 @app.get("/health")
 async def health():
