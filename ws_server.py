@@ -361,10 +361,14 @@ async def recording(request: Request, background_tasks: BackgroundTasks):
         resp.say("We couldn't process your recording. Please try again later.", voice="alice")
         return Response(content=str(resp), media_type="text/xml", status_code=200)
 
-    # ACK quickly and process in background
+    # Start background processing
     background_tasks.add_task(process_recording_background, call_sid, recording_url, from_number)
-    # Twilio accepts 204 or a valid TwiML; return 204
-    return Response(status_code=204)
+
+    # Return TwiML to redirect to /hold (keeps call active)
+    resp = VoiceResponse()
+    hold_url = request.url_for("hold") + f"?convo_id={call_sid}"
+    resp.redirect(hold_url)
+    return Response(content=str(resp), media_type="text/xml")
 
 # ---------------- background pipeline ----------------
 async def process_recording_background(call_sid: str, recording_url: str, from_number: Optional[str] = None):
@@ -429,31 +433,16 @@ async def process_recording_background(call_sid: str, recording_url: str, from_n
                     logger.exception("[%s] memory write failed: %s", call_sid, mw)
 
         # generate TTS and upload & set hold_store ready payload
+        tts_url = None
         try:
             tts_url = create_and_upload_tts(reply_text)
-            payload = {"tts_url": tts_url, "reply_text": reply_text}
-            hold_store.set_ready(call_sid, payload)
-            logger.info("[%s] set hold ready with tts_url", call_sid)
+            logger.info("[%s] TTS generated and uploaded: %s", call_sid, tts_url)
         except Exception:
-            logger.exception("[%s] TTS generation/upload failed", call_sid)
-            # if TTS fails, still set a friendly message (so /hold returns Say fallback)
-            payload = {"tts_url": None, "reply_text": reply_text}
-            hold_store.set_ready(call_sid, payload)
+            logger.exception("[%s] TTS generation/upload failed; falling back to Say", call_sid)
 
-        # attempt to update live call with Play + Record
-        # Build TwiML: Play (if tts_url) else Say; then Record for follow-up
-        try:
-            tts_payload = hold_store.get_ready(call_sid)
-            twiml = VoiceResponse()
-            if tts_payload and tts_payload.get("tts_url"):
-                twiml.play(tts_payload.get("tts_url"))
-            else:
-                twiml.say(tts_payload.get("reply_text") if tts_payload else reply_text, voice="alice")
-            # after speaking, record follow-up input (short)
-            twiml.record(max_length=30, action=recording_callback_url(), play_beep=True, timeout=2)
-            _safe_update_or_call(call_sid, from_number, str(twiml))
-        except Exception:
-            logger.exception("[%s] Failed to update live call after hold set", call_sid)
+        payload = {"tts_url": tts_url, "reply_text": reply_text}
+        hold_store.set_ready(call_sid, payload)
+        logger.info("[%s] set hold ready", call_sid)
         return
     except Exception as e:
         logger.exception("[%s] Unexpected error in background pipeline: %s", call_sid, e)
