@@ -541,49 +541,72 @@ def _safe_update_or_call(call_sid: str, from_number: Optional[str], twiml: str):
         logger.exception("[%s] safe_update_or_call unexpected error: %s", call_sid, e)
 
 # ---------------- /hold endpoint (poll until ready) ----------------
+# Replace your existing /hold handler with this function.
 @app.get("/hold")
 @app.post("/hold")
 async def hold(request: Request, convo_id: str = Query(...)):
     """
-    Polls hold_store for readiness:
+    Polls hold_store for readiness.
       - If ready: return Play(tts_url) + Record (final TwiML), then clear store.
-      - If not ready: Pause then Redirect back to /hold (loop).
-    This handler is hardened: any internal error results in valid TwiML (no 500).
+      - If not ready: Say a friendly message, Pause, then Redirect back to /hold (absolute URL).
+    This handler always returns valid TwiML (no 500) so Twilio won't play "application error".
     """
     try:
-        ready = hold_store.get_ready(convo_id)
-    except Exception:
-        logger.exception("Hold endpoint: error reading hold_store for %s", convo_id)
         ready = None
+        try:
+            ready = hold_store.get_ready(convo_id)
+        except Exception:
+            logger.exception("Hold endpoint: error reading hold_store for %s", convo_id)
+            ready = None
 
-    try:
         resp = VoiceResponse()
+
         if ready:
+            # If we have a ready payload, prefer the TTS URL; else fallback to reply_text via Say
             tts_url = _unescape_url(ready.get("tts_url")) if isinstance(ready, dict) else None
             if tts_url:
                 resp.play(tts_url)
             else:
-                # fallback to Say with reply_text if present
                 reply = ready.get("reply_text") if isinstance(ready, dict) else None
                 if reply:
                     resp.say(reply, voice="alice")
                 else:
                     resp.say("Sorry, I couldn't generate your audio. We'll call you back shortly.", voice="alice")
-            # After delivering, include Record to capture follow-up and then end
+
+            # After delivering, record follow-up and then end
             resp.record(max_length=30, action=recording_callback_url(), play_beep=True, timeout=2)
-            # clear hold_store (best-effort)
+
+            # Best-effort clear (get_ready already pops it in most implementations)
             try:
                 hold_store.clear(convo_id)
             except Exception:
                 logger.exception("Failed clearing hold_store for %s", convo_id)
+
             return Response(content=str(resp), media_type="text/xml")
-        else:
-            # Not ready: Pause a bit then Redirect back to /hold (loop)
-            resp.pause(length=5)
-            # Redirect to same /hold to poll again; Twilio will fetch the Redirect URL
-            redirect_url = f"https://{HOSTNAME}/hold?convo_id={convo_id}" if HOSTNAME else f"/hold?convo_id={convo_id}"
-            resp.redirect(redirect_url)
-            return Response(content=str(resp), media_type="text/xml")
+
+        # Not ready: tell the caller we're working, pause, then redirect back to the absolute /hold URL.
+        # Build absolute redirect URL using request.base_url + request.url_for
+        try:
+            base = str(request.base_url).rstrip("/")
+            hold_path = str(request.url_for("hold"))
+            # Ensure single leading slash on hold_path
+            if not hold_path.startswith("/"):
+                hold_path = "/" + hold_path
+            redirect_url = f"{base}{hold_path}?convo_id={convo_id}"
+        except Exception:
+            # Fallback: use HOSTNAME env if available or a relative path
+            if HOSTNAME:
+                redirect_url = f"https://{HOSTNAME}/hold?convo_id={convo_id}"
+            else:
+                redirect_url = f"/hold?convo_id={convo_id}"
+
+        # Friendly message before redirect (reduces chance Twilio treats rapid re-requests as an error)
+        resp.say("Please hold while I prepare your response. This may take a few seconds.", voice="alice")
+        # Pause longer to avoid too-tight polling
+        resp.pause(length=8)
+        resp.redirect(redirect_url)
+        return Response(content=str(resp), media_type="text/xml")
+
     except Exception as e:
         logger.exception("Unhandled error in /hold handler for %s: %s", convo_id, e)
         # Always return valid TwiML rather than raising 500
