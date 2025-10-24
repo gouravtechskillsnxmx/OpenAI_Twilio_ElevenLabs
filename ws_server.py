@@ -87,11 +87,15 @@ if REDIS_URL:
         import redis
         redis_client = redis.from_url(REDIS_URL, decode_responses=True)
     except Exception as e:
-        logger.warning("Redis failed: %s", e)
+        logger.warning("Redis failed to init: %s", e)
 
 class HoldStore:
     @staticmethod
     def set_ready(convo_id: str, payload: dict, expire: int = 3600) -> bool:
+        """
+        Set hold result. Returns True if stored in Redis successfully.
+        Falls back to in-memory + file storage on error.
+        """
         try:
             if redis_client:
                 try:
@@ -99,11 +103,12 @@ class HoldStore:
                     logger.info("Redis: set hold:%s", convo_id)
                     return True
                 except Exception:
-                    logger.exception("Redis set failed")
+                    logger.exception("Redis set failed; falling back")
+            # fallback to memory + file
             _hold_in_memory[convo_id] = payload
             p = Path(HOLD_STORE_DIR) / f"{convo_id}.json"
             p.write_text(json.dumps(payload))
-            logger.info("File fallback: %s", p)
+            logger.info("File fallback: wrote %s", p)
             return False
         except Exception as e:
             logger.exception("HoldStore.set_ready error: %s", e)
@@ -111,48 +116,67 @@ class HoldStore:
 
     @staticmethod
     def get_ready(convo_id: str) -> Optional[dict]:
+        """
+        Read & remove hold payload (Redis first, then memory, then file).
+        """
         # Redis
         if redis_client:
             try:
                 v = redis_client.get(f"hold:{convo_id}")
                 if v:
                     data = json.loads(v)
-                    redis_client.delete(f"hold:{convo_id}")
+                    try:
+                        redis_client.delete(f"hold:{convo_id}")
+                    except Exception:
+                        pass
                     logger.info("Redis: got hold:%s", convo_id)
                     return data
             except Exception:
-                pass
+                logger.exception("Redis get failed; trying fallback")
 
         # In-memory
         if convo_id in _hold_in_memory:
             data = _hold_in_memory.pop(convo_id)
             p = Path(HOLD_STORE_DIR) / f"{convo_id}.json"
             if p.exists():
-                p.unlink()
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
             logger.info("In-memory: popped hold:%s", convo_id)
             return data
 
-        # File
+        # File fallback
         p = Path(HOLD_STORE_DIR) / f"{convo_id}.json"
         if p.exists():
             try:
                 data = json.loads(p.read_text())
-                p.unlink()
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
                 logger.info("File: read hold:%s", convo_id)
                 return data
             except Exception:
-                pass
+                logger.exception("File fallback read failed for %s", p)
+
         return None
 
     @staticmethod
     def clear(convo_id: str):
         try:
             if redis_client:
-                redis_client.delete(f"hold:{convo_id}")
+                try:
+                    redis_client.delete(f"hold:{convo_id}")
+                except Exception:
+                    pass
             _hold_in_memory.pop(convo_id, None)
             p = Path(HOLD_STORE_DIR) / f"{convo_id}.json"
             if p.exists():
-                p.unlink()
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -180,8 +204,34 @@ def _unescape_url(u: Optional[str]) -> Optional[str]:
     except Exception:
         return u
 
+def is_url_playable(url: Optional[str], timeout=(3, 8)) -> bool:
+    """
+    Quick ranged GET check to see if a remote audio URL is reachable and serves range requests.
+    Accepts 200 or 206 as playable. Returns False on any error.
+    """
+    if not url:
+        return False
+    try:
+        headers = {"Range": "bytes=0-0"}
+        r = requests.get(url, headers=headers, timeout=timeout, stream=True)
+        status = getattr(r, "status_code", None)
+        try:
+            r.close()
+        except Exception:
+            pass
+        if status in (200, 206):
+            return True
+        logger.warning("is_url_playable -> status %s for %s", status, url)
+        return False
+    except Exception as e:
+        logger.warning("is_url_playable error for %s: %s", url, e)
+        return False
+
 # ---------------- TTS ----------------
 def create_tts_elevenlabs(text: str) -> bytes:
+    """
+    Call ElevenLabs and return audio bytes. If ElevenLabs is not configured, raises.
+    """
     if not ELEVEN_API_KEY or not ELEVEN_VOICE:
         raise RuntimeError("ElevenLabs not configured")
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE}"
@@ -190,29 +240,48 @@ def create_tts_elevenlabs(text: str) -> bytes:
     r = requests.post(url, json=data, headers=headers, timeout=30)
     r.raise_for_status()
     return r.content
-#---------Chatgpt
+
 def create_and_upload_tts(text: str, expires_in: int = TTS_PRESIGNED_EXPIRES) -> Optional[str]:
+    """
+    Generate audio bytes via ElevenLabs (if configured) then upload to S3 and return presigned URL.
+    If ElevenLabs is not available or returns 401/other error, return None to indicate fallback to text.
+    """
     try:
         audio_bytes = create_tts_elevenlabs(text)
     except requests.HTTPError as e:
-        # If ElevenLabs returns 401 — log and fallback to text-only response.
         status = getattr(e.response, "status_code", None)
         logger.error("ElevenLabs TTS failed (status=%s). Falling back to text. Error: %s", status, e)
-        # return None so caller will put reply_text into hold_store instead of tts_url
         return None
     except Exception:
         logger.exception("Unexpected error creating TTS; falling back to text-only")
         return None
 
-    # existing S3 upload logic below (unchanged)...
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
-    tmp.write(audio_bytes)
-    tmp.flush()
-    tmp.close()
-    key = f"tts/{os.path.basename(tmp.name)}"
-    s3.upload_file(tmp.name, S3_BUCKET, key, ExtraArgs={"ContentType": "audio/mpeg"})
-    presigned = s3.generate_presigned_url("get_object", Params={"Bucket": S3_BUCKET, "Key": key}, ExpiresIn=expires_in)
-    return presigned
+    # Upload to S3
+    try:
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+        tmp.write(audio_bytes)
+        tmp.flush()
+        tmp.close()
+        key = f"tts/{os.path.basename(tmp.name)}"
+        try:
+            s3.upload_file(tmp.name, S3_BUCKET, key, ExtraArgs={"ContentType": "audio/mpeg"})
+        except Exception:
+            logger.exception("S3 upload failed for %s/%s", S3_BUCKET, key)
+            # Best to remove temp file
+            try:
+                os.unlink(tmp.name)
+            except Exception:
+                pass
+            raise
+        # generate presigned URL
+        presigned = s3.generate_presigned_url("get_object", Params={"Bucket": S3_BUCKET, "Key": key}, ExpiresIn=expires_in)
+        return presigned
+    finally:
+        # best-effort cleanup of tmp file
+        try:
+            os.unlink(tmp.name)
+        except Exception:
+            pass
 
 # ---------------- AGENT ----------------
 def call_agent_and_get_reply(convo_id: str, user_text: str, timeout: int = 15) -> Dict[str, Any]:
@@ -241,7 +310,7 @@ def call_agent_and_get_reply(convo_id: str, user_text: str, timeout: int = 15) -
                 ],
                 max_tokens=256
             )
-            content = resp.choices[0].message.content if resp.choices else ""
+            content = resp.choices[0].message.content if getattr(resp, "choices", None) else ""
             return {"reply_text": content.strip(), "memory_writes": []}
         except Exception:
             logger.exception("OpenAI failed")
@@ -279,84 +348,158 @@ async def recording(request: Request, background_tasks: BackgroundTasks):
         resp.say("Error processing recording.", voice="alice")
         return Response(content=str(resp), media_type="text/xml", status_code=200)
 
+    # launch background
     background_tasks.add_task(process_recording_background, call_sid, recording_url, from_number)
 
-    # FIXED: Manual URL with query param
+    # Keep the caller on hold while we prepare the response.
+    # We redirect to /hold; Twilio will fetch /hold and stay in a pause/redirect loop until
+    # the background sets the hold payload.
     hold_url = f"{request.base_url}hold?convo_id={call_sid}"
     resp = VoiceResponse()
+    resp.say("Please hold while I prepare your response.", voice="alice")
+    resp.pause(length=5)
     resp.redirect(hold_url)
     return Response(content=str(resp), media_type="text/xml")
+
 # ---------------- BACKGROUND ----------------
 async def process_recording_background(call_sid: str, recording_url: str, from_number: Optional[str] = None):
-    logger.info("[%s] Background start", call_sid)
+    logger.info("[%s] Background start - download_url=%s", call_sid, recording_url)
     try:
         url = build_download_url(recording_url)
         auth = HTTPBasicAuth(TWILIO_SID, TWILIO_TOKEN) if TWILIO_SID and "api.twilio.com" in url else None
-        r = requests.get(url, auth=auth, timeout=30)
-        r.raise_for_status()
+        try:
+            r = requests.get(url, auth=auth, timeout=30)
+            r.raise_for_status()
+        except Exception as e:
+            logger.exception("[%s] Failed to download recording: %s", call_sid, e)
+            # set safe fallback and return
+            hold_store.set_ready(call_sid, {"tts_url": None, "reply_text": "Sorry, we couldn't retrieve your recording right now."})
+            return
 
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
         tmp.write(r.content)
+        tmp.flush()
         tmp.close()
         file_path = tmp.name
-        logger.info("[%s] Saved recording", call_sid)
+        logger.info("[%s] saved recording to %s", call_sid, file_path)
 
         transcript = ""
         try:
             transcript = transcribe_with_openai(file_path)
-            logger.info("[%s] Transcript: %s", call_sid, transcript)
+            logger.info("[%s] transcript: %s", call_sid, transcript)
         except Exception as e:
-            logger.exception("[%s] Transcribe failed", call_sid)
-        finally:
+            logger.exception("[%s] STT/transcription failed: %s", call_sid, e)
+            transcript = ""
+
+        # cleanup audio file
+        try:
             os.unlink(file_path)
+        except Exception:
+            pass
 
-        agent_out = call_agent_and_get_reply(call_sid, transcript or " ")
-        reply_text = agent_out.get("reply_text", "Sorry.")
-        memory_writes = agent_out.get("memory_writes", [])
+        # Agent call - expects structured dict
+        try:
+            agent_out = call_agent_and_get_reply(call_sid, transcript or " ")
+            reply_text = (agent_out.get("reply_text") if isinstance(agent_out, dict) else str(agent_out)) or ""
+            memory_writes = agent_out.get("memory_writes") if isinstance(agent_out, dict) else []
+        except Exception as e:
+            logger.exception("[%s] agent call failed: %s", call_sid, e)
+            reply_text = "Sorry, I'm having trouble right now."
+            memory_writes = []
 
-        for mw in memory_writes:
-            try:
-                if callable(write_fact):
-                    write_fact(mw)
-            except Exception:
-                pass
+        logger.info("[%s] assistant reply (truncated): %s", call_sid, (reply_text[:300] + "...") if len(reply_text) > 300 else reply_text)
 
+        # If agent returned memory writes, persist them (best-effort)
+        if memory_writes and isinstance(memory_writes, list):
+            for mw in memory_writes:
+                try:
+                    if callable(write_fact):
+                        write_fact(mw)
+                except Exception:
+                    logger.exception("[%s] failed to write memory write: %s", call_sid, mw)
+
+        # TTS via ElevenLabs and S3 upload. If TTS not available/failed, tts_url will be None.
         tts_url = None
         try:
-            tts_url = create_and_upload_tts(reply_text)
-            logger.info("[%s] TTS uploaded", call_sid)
-        except Exception:
-            logger.exception("[%s] TTS failed", call_sid)
+            candidate = create_and_upload_tts(reply_text)
+            # unescape (in case S3 presigned URL contains &amp;)
+            candidate_unescaped = _unescape_url(candidate) if candidate else None
+            if candidate_unescaped and is_url_playable(candidate_unescaped):
+                tts_url = candidate_unescaped
+                logger.info("[%s] tts_url: %s", call_sid, tts_url)
+            else:
+                if candidate:
+                    logger.warning("[%s] Created TTS but URL not playable; falling back to text reply", call_sid)
+                tts_url = None
+        except Exception as e:
+            logger.exception("[%s] TTS generation/upload failed: %s", call_sid, e)
+            tts_url = None
 
-        hold_store.set_ready(call_sid, {"tts_url": tts_url, "reply_text": reply_text})
-        logger.info("[%s] Hold ready", call_sid)
+        # persist hold payload
+        try:
+            hold_store.set_ready(call_sid, {"tts_url": tts_url, "reply_text": reply_text})
+            logger.info("[%s] Hold ready", call_sid)
+        except Exception:
+            logger.exception("[%s] Failed to set hold ready", call_sid)
+
+        # If call has ended by now, create fallback outbound call to play response (best-effort).
+        try:
+            if twilio_client and from_number:
+                call = twilio_client.calls(call_sid).fetch()
+                status = getattr(call, "status", "").lower()
+                if status not in ("in-progress", "queued", "ringing"):
+                    # call ended, create outbound fallback to play the reply
+                    twiml = None
+                    if tts_url:
+                        twiml = f"<Response><Play>{tts_url}</Play></Response>"
+                    else:
+                        safe_text = (reply_text or "Hello. I have a response for you.").replace("&", " and ")
+                        twiml = f"<Response><Say>{safe_text}</Say></Response>"
+                    try:
+                        created = twilio_client.calls.create(to=from_number, from_=TWILIO_FROM, twiml=twiml)
+                        logger.info("[%s] Created outbound fallback call %s", call_sid, getattr(created, "sid", "unknown"))
+                    except Exception:
+                        logger.exception("[%s] Failed creating fallback outbound call", call_sid)
+        except Exception:
+            # non-fatal
+            pass
 
     except Exception as e:
-        logger.exception("[%s] Background error: %s", call_sid, e)
+        logger.exception("[%s] Unexpected pipeline error: %s", call_sid, e)
         hold_store.set_ready(call_sid, {"tts_url": None, "reply_text": "Sorry, something went wrong."})
 
 # ---------------- HOLD ----------------
 @app.get("/hold")
 @app.post("/hold")
 async def hold(request: Request, convo_id: str = Query(...)):
+    """
+    Twilio will repeatedly request /hold while the background prepares the response.
+    When ready, we either <Play> the presigned S3 URL (if reachable) or <Say> the reply_text.
+    """
     try:
         ready = hold_store.get_ready(convo_id)
         resp = VoiceResponse()
 
         if ready:
             tts_url = _unescape_url(ready.get("tts_url"))
-            if tts_url:
+            if tts_url and is_url_playable(tts_url):
                 resp.play(tts_url)
             else:
-                resp.say(ready.get("reply_text", "No response."), voice="alice")
+                # Fallback to speak text (avoid empty text)
+                txt = ready.get("reply_text", "")
+                if not txt:
+                    txt = "Sorry, I don't have an answer right now."
+                resp.say(txt, voice="alice")
+            # After playing/saying the reply, prompt for more (records again).
             resp.record(max_length=30, action=recording_callback_url(), play_beep=True, timeout=2)
             return Response(content=str(resp), media_type="text/xml")
 
-        # Manual redirect URL
+        # Not ready -> keep caller on hold and redirect back to /hold so Twilio polls again.
         base = str(request.base_url).rstrip("/")
-        redirect_url = f"{base}hold?convo_id={convo_id}"
+        redirect_url = f"{base}/hold?convo_id={convo_id}"
 
         resp.say("Please hold while I prepare your response.", voice="alice")
+        # pause for a bit, then redirect back to /hold. Twilio will repeat until background sets the hold.
         resp.pause(length=8)
         resp.redirect(redirect_url)
         return Response(content=str(resp), media_type="text/xml")
@@ -366,6 +509,7 @@ async def hold(request: Request, convo_id: str = Query(...)):
         resp = VoiceResponse()
         resp.say("An error occurred.", voice="alice")
         return Response(content=str(resp), media_type="text/xml")
+
 # ---------------- HEALTH ----------------
 @app.get("/health")
 async def health():
